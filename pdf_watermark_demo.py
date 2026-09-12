@@ -57,6 +57,11 @@ MODE_CM = "cm"
 CM_TO_PT = 28.3464567             # 1 cm = 72/2.54 pt
 
 
+def _path_identity(path: str) -> str:
+    """Return the platform-normalized identity for a user-selected path."""
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 # ---------------------------------------------------------------- 模拟数据
 @dataclass
 class PageState:
@@ -1375,13 +1380,14 @@ class DemoWindow(QMainWindow):
                 existing.add(norm)
                 added_pdf += 1
         if imgs:
-            existing = {Path(p) for p in self._images}
+            existing = {_path_identity(p) for p in self._images}
             for p in imgs:
                 norm = os.path.normpath(p)
-                if norm in existing:
+                identity = _path_identity(norm)
+                if identity in existing:
                     continue
                 self._images.append(norm)
-                existing.add(norm)
+                existing.add(identity)
                 self.img_list.addItem(Path(norm).name)
                 self.img_list.item(self.img_list.count() - 1).setData(
                     Qt.UserRole, norm)
@@ -1725,13 +1731,14 @@ class DemoWindow(QMainWindow):
             "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
         if not files:
             return
-        existing = {Path(p) for p in self._images}
+        existing = {_path_identity(p) for p in self._images}
         for f in files:
             norm = os.path.normpath(f)
-            if norm in existing:
+            identity = _path_identity(norm)
+            if identity in existing:
                 continue
             self._images.append(norm)
-            existing.add(norm)
+            existing.add(identity)
             self.img_list.addItem(Path(norm).name)
             self.img_list.item(self.img_list.count() - 1).setData(
                 Qt.UserRole, norm)
