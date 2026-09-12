@@ -1,0 +1,7 @@
+PySide6
+PyMuPDF
+PyPDF2
+reportlab
+Pillow
+# 仅打包 exe 时需要：pip install pyinstaller
+pyinstaller

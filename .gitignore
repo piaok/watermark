@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.mimocode/
+build/
+build_assets/
+dist/
+*.spec
+/*.pdf
+/*.png
+.env
+.env.*
+!.env.example
