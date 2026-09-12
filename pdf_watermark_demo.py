@@ -1745,14 +1745,31 @@ class DemoWindow(QMainWindow):
         self.refresh_cards()
 
     def _remove_img_mock(self) -> None:
-        removed = []
-        for i in sorted({r.row() for r in self.img_list.selectedIndexes()},
-                        reverse=True):
-            item = self.img_list.takeItem(i)
-            if item is not None:
-                removed.append(item.data(Qt.UserRole))
-        self._images = [p for p in self._images
-                        if p not in {r for r in removed}]
+        removed_rows = {index.row() for index in self.img_list.selectedIndexes()}
+        if not removed_rows:
+            return
+
+        old_to_new = {
+            old_index: new_index
+            for new_index, old_index in enumerate(
+                index for index in range(len(self._images))
+                if index not in removed_rows
+            )
+        }
+        for index in sorted(removed_rows, reverse=True):
+            self.img_list.takeItem(index)
+        self._images = [
+            image_path
+            for old_index, image_path in enumerate(self._images)
+            if old_index in old_to_new
+        ]
+        for pdf in self.files:
+            for page in pdf.pages:
+                page.image_offsets = {
+                    old_to_new[old_index]: offset
+                    for old_index, offset in page.image_offsets.items()
+                    if old_index in old_to_new
+                }
         self.refresh_cards()
 
     def _pick_dir(self) -> None:
