@@ -126,7 +126,14 @@ def main() -> int:
         demo.PageState(wm=True, dx=20.0, dy=30.0, size_mode=demo.MODE_PERCENT,
                        percent=40.0),
         STAMP))
-    # E: 双水印不同偏移
+    # E: 旋转页右上对齐换算后的中心相对 pt 偏移 + 固定 pt 宽度
+    # 显示页为 842x595pt；章.png 为 1132x513，固定宽 140pt 时高 63.445pt。
+    results.append(check_case(
+        "rot90_top_right_fixed140", rot,
+        demo.PageState(wm=True, dx=339.0, dy=-253.777385,
+                       size_mode=demo.MODE_FIXED, fixed_width=140.0),
+        STAMP))
+    # F: 双水印不同偏移
     out2 = TMP / "two.pdf"
     st_a = demo.PageState(wm=True, dx=-60.0, dy=-80.0,
                           size_mode=demo.MODE_PERCENT, percent=25.0)

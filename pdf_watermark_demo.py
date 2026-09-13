@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional
 
@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_watermark_studio.core.engine import (
-    Layout, SizeMode, rect_for,
+    Anchor, Layout, SizeMode, rect_for,
     render_page_bg, composite_watermark, list_pdf_pages,
     image_native_size,
 )
@@ -55,6 +55,8 @@ ORIG_W, ORIG_H = 300, 186          # 模拟水印图片「原始尺寸」（页�
 MODE_PERCENT = "percent"
 MODE_ORIGINAL = "original"
 MODE_CM = "cm"
+MODE_FIXED = "fixed"
+ANCHOR_KEEP = "keep"
 CM_TO_PT = 28.3464567             # 1 cm = 72/2.54 pt
 
 
@@ -72,8 +74,10 @@ class PageState:
     dy: float = 0.0
     size_mode: str = MODE_PERCENT
     percent: float = 30.0
+    fixed_width: float = 180.0     # FIXED：PDF 点（pt）
     cm_w: float = 5.0             # CM：宽（cm）
     cm_h: float = 5.0             # CM：高（cm）
+    opacity: float = 1.0           # 0~1，仅预览；导出始终不透明
     # 每张水印图在本页的独立位置；未记录时使用 dx/dy 作为默认位置
     image_offsets: dict[int, tuple[float, float]] = field(default_factory=dict)
 
@@ -100,22 +104,27 @@ def page_layout(st: PageState, zoom: float = 1.0,
     原始尺寸模式需要知道图片原生像素（image_path 或 native_size 二选一）。
     """
     dx, dy = st.dx * zoom, st.dy * zoom
+    common = {"dx": dx, "dy": dy, "opacity": st.opacity,
+              "margin": 12.0 * zoom}
     if st.size_mode == MODE_ORIGINAL:
         if native_size is None and image_path is not None:
             native_size = image_native_size(Path(image_path))
         if native_size is None:
-            return Layout(size_mode=SizeMode.DEFAULT, dx=dx, dy=dy)
+            return Layout(size_mode=SizeMode.DEFAULT, **common)
         iw, ih = native_size
         return Layout(size_mode=SizeMode.FIXED,
                       fixed_width=max(1, round(iw * zoom)),
-                      fixed_height=max(1.0, ih * zoom),
-                      dx=dx, dy=dy)
+                      fixed_height=max(1.0, ih * zoom), **common)
+    if st.size_mode == MODE_FIXED:
+        return Layout(size_mode=SizeMode.FIXED,
+                      fixed_width=max(1.0, st.fixed_width * zoom),
+                      **common)
     if st.size_mode == MODE_CM:
         return Layout(size_mode=SizeMode.FIXED,
                       fixed_width=max(1, round(st.cm_w * CM_TO_PT * zoom)),
                       fixed_height=max(1, round(st.cm_h * CM_TO_PT * zoom)),
-                      dx=dx, dy=dy)
-    return Layout(size_mode=SizeMode.PERCENT, percent=st.percent, dx=dx, dy=dy)
+                      **common)
+    return Layout(size_mode=SizeMode.PERCENT, percent=st.percent, **common)
 
 
 # 预览渲染 zoom（与 render_page_bg / _background 保持一致）
@@ -175,6 +184,7 @@ def render_page(pixmap: QPixmap, pdf: MockPdf, page_index: int,
             width = PAGE_W * st.percent / 100
             height = width * 0.62
         # 多张水印图：依次绘制；位置用每张图的独立偏移（默认 st.dx/dy）
+        painter.setOpacity(st.opacity)
         base_x, base_y = st.dx, st.dy
         for img_idx in range(len(image_paths)):
             if img_idx == active_image_index and active_offset is not None:
@@ -195,9 +205,7 @@ def _composite_multi(pil, st: PageState, image_paths: List[str]):
     result = pil
     for idx, path in enumerate(image_paths):
         dx, dy = st.image_offsets.get(idx, (st.dx, st.dy))
-        local = PageState(wm=True, dx=dx, dy=dy,
-                          size_mode=st.size_mode, percent=st.percent,
-                          cm_w=st.cm_w, cm_h=st.cm_h)
+        local = replace(st, wm=True, dx=dx, dy=dy, image_offsets={})
         result = composite_watermark(result,
                                      page_layout(local, zoom=PREVIEW_ZOOM,
                                                  image_path=path),
@@ -531,6 +539,7 @@ class PageGridDialog(QDialog):
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("页面宽度百分比", MODE_PERCENT)
         self.mode_combo.addItem("原始尺寸", MODE_ORIGINAL)
+        self.mode_combo.addItem("固定宽度 (pt)", MODE_FIXED)
         self.mode_combo.addItem("长宽尺寸 (cm)", MODE_CM)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         left.addWidget(self.mode_combo)
@@ -538,6 +547,17 @@ class PageGridDialog(QDialog):
         self.slider.setRange(1, 200)
         self.slider.valueChanged.connect(self._on_percent_changed)
         left.addWidget(self.slider)
+        fixed_row = QHBoxLayout()
+        fixed_row.addWidget(QLabel("宽"))
+        self.fixed_width_spin = QDoubleSpinBox()
+        self.fixed_width_spin.setRange(1.0, 2000.0)
+        self.fixed_width_spin.setDecimals(1)
+        self.fixed_width_spin.setSuffix(" pt")
+        self.fixed_width_spin.valueChanged.connect(self._on_fixed_width_changed)
+        fixed_row.addWidget(self.fixed_width_spin)
+        self.fixed_row_widget = QWidget()
+        self.fixed_row_widget.setLayout(fixed_row)
+        left.addWidget(self.fixed_row_widget)
         # cm 模式：宽×高 输入
         cm_row = QHBoxLayout()
         self.cm_w_spin = QDoubleSpinBox()
@@ -768,9 +788,7 @@ class PageGridDialog(QDialog):
         pt_w, pt_h = bw / PREVIEW_ZOOM, bh / PREVIEW_ZOOM
         iw, ih = image_native_size(Path(path))
         dx, dy = st.image_offsets.get(idx, (st.dx, st.dy))
-        local = PageState(wm=True, dx=dx, dy=dy,
-                          size_mode=st.size_mode, percent=st.percent,
-                          cm_w=st.cm_w, cm_h=st.cm_h)
+        local = replace(st, wm=True, dx=dx, dy=dy, image_offsets={})
         lx, ly, lw, lh = rect_for(page_layout(local, 1.0, image_path=path,
                                               native_size=(iw, ih)),
                                   pt_w, pt_h, iw, ih)
@@ -812,6 +830,7 @@ class PageGridDialog(QDialog):
         if st.wm and self.image_paths:
             painter = QPainter(base)
             painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.setOpacity(st.opacity)
             for idx, path in enumerate(self.image_paths):
                 try:
                     rect = self._stamp_rect_px(st, page, idx, path)
@@ -845,7 +864,9 @@ class PageGridDialog(QDialog):
     def _sync_size_controls(self) -> None:
         st = self.pdf.pages[self.current_page]
         mode = st.size_mode
-        idx = {MODE_PERCENT: 0, MODE_ORIGINAL: 1, MODE_CM: 2}.get(mode, 0)
+        idx = self.mode_combo.findData(mode)
+        if idx < 0:
+            idx = 0
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentIndex(idx)
         self.mode_combo.blockSignals(False)
@@ -853,6 +874,10 @@ class PageGridDialog(QDialog):
         self.slider.setValue(int(st.percent))
         self.slider.blockSignals(False)
         self.slider.setEnabled(mode == MODE_PERCENT)
+        self.fixed_row_widget.setVisible(mode == MODE_FIXED)
+        self.fixed_width_spin.blockSignals(True)
+        self.fixed_width_spin.setValue(st.fixed_width)
+        self.fixed_width_spin.blockSignals(False)
         self.cm_row_widget.setVisible(mode == MODE_CM)
         self.cm_w_spin.blockSignals(True)
         self.cm_w_spin.setValue(st.cm_w)
@@ -866,6 +891,7 @@ class PageGridDialog(QDialog):
         st = self.pdf.pages[self.current_page]
         st.size_mode = mode
         self.slider.setEnabled(mode == MODE_PERCENT)
+        self.fixed_row_widget.setVisible(mode == MODE_FIXED)
         self.cm_row_widget.setVisible(mode == MODE_CM)
         self.render()
         self.on_change()
@@ -880,6 +906,12 @@ class PageGridDialog(QDialog):
         st = self.pdf.pages[self.current_page]
         st.cm_w = self.cm_w_spin.value()
         st.cm_h = self.cm_h_spin.value()
+        self.render()
+        self.on_change()
+
+    def _on_fixed_width_changed(self, value: float) -> None:
+        st = self.pdf.pages[self.current_page]
+        st.fixed_width = value
         self.render()
         self.on_change()
 
@@ -1599,30 +1631,68 @@ class DemoWindow(QMainWindow):
         lg = QGridLayout(lay_box)
         lg.addWidget(QLabel("对齐方式"), 0, 0)
         self.anchor_combo = QComboBox()
-        self.anchor_combo.addItems(["居中", "顶部居中", "底部居中",
-                                    "左上", "右上", "左下", "右下"])
+        self.anchor_combo.addItem("保留当前位置", ANCHOR_KEEP)
+        for label, anchor in (
+            ("居中", Anchor.CENTER),
+            ("顶部居中", Anchor.TOP_CENTER),
+            ("底部居中", Anchor.BOTTOM_CENTER),
+            ("左上", Anchor.TOP_LEFT),
+            ("右上", Anchor.TOP_RIGHT),
+            ("左下", Anchor.BOTTOM_LEFT),
+            ("右下", Anchor.BOTTOM_RIGHT),
+        ):
+            self.anchor_combo.addItem(label, anchor.value)
         lg.addWidget(self.anchor_combo, 0, 1, 1, 2)
         lg.addWidget(QLabel("尺寸模式"), 1, 0)
         self.size_mode_combo = QComboBox()
-        self.size_mode_combo.addItems(["页面宽度百分比", "原始尺寸", "固定像素宽度"])
+        self.size_mode_combo.addItem("页面宽度百分比", MODE_PERCENT)
+        self.size_mode_combo.addItem("原始尺寸", MODE_ORIGINAL)
+        self.size_mode_combo.addItem("固定宽度 (pt)", MODE_FIXED)
+        self.size_mode_combo.currentIndexChanged.connect(
+            self._home_size_mode_changed)
         lg.addWidget(self.size_mode_combo, 1, 1, 1, 2)
-        lg.addWidget(QLabel("页面宽度占比"), 2, 0)
+        self.percent_label = QLabel("页面宽度占比")
+        lg.addWidget(self.percent_label, 2, 0)
         self.size_spin = QSpinBox()
         self.size_spin.setRange(1, 200)
         self.size_spin.setValue(30)
         self.size_spin.setSuffix(" %")
         lg.addWidget(self.size_spin, 2, 1, 1, 2)
         self.size_slider = QSlider(Qt.Horizontal)
-        self.size_slider.setRange(1, 100)
+        self.size_slider.setRange(1, 200)
         self.size_slider.setValue(30)
+        self.size_spin.valueChanged.connect(self.size_slider.setValue)
+        self.size_slider.valueChanged.connect(self.size_spin.setValue)
         lg.addWidget(self.size_slider, 3, 0, 1, 3)
-        lg.addWidget(QLabel("预览透明度"), 4, 0)
+        self.fixed_width_label = QLabel("固定宽度")
+        lg.addWidget(self.fixed_width_label, 4, 0)
+        self.fixed_width_spin = QDoubleSpinBox()
+        self.fixed_width_spin.setRange(1.0, 2000.0)
+        self.fixed_width_spin.setDecimals(1)
+        self.fixed_width_spin.setValue(180.0)
+        self.fixed_width_spin.setSuffix(" pt")
+        lg.addWidget(self.fixed_width_spin, 4, 1, 1, 2)
+        lg.addWidget(QLabel("预览透明度"), 5, 0)
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(1, 100)
         self.opacity_slider.setValue(100)
-        lg.addWidget(self.opacity_slider, 4, 1, 1, 2)
-        self.opacity_value = QLabel("100%")
-        lg.addWidget(self.opacity_value, 5, 1, 1, 2)
+        self.opacity_slider.valueChanged.connect(
+            lambda value: self.opacity_value.setText(f"{value}%（仅预览）"))
+        lg.addWidget(self.opacity_slider, 5, 1, 1, 2)
+        self.opacity_value = QLabel("100%（仅预览）")
+        lg.addWidget(self.opacity_value, 6, 1, 1, 2)
+        self.layout_scope_label = QLabel(
+            "作用范围：全部文档页面。调整参数后点击应用。")
+        self.layout_scope_label.setWordWrap(True)
+        lg.addWidget(self.layout_scope_label, 7, 0, 1, 3)
+        self.anchor_hint_label = QLabel(
+            "选择对齐方式会重设每页每张图片的位置。")
+        self.anchor_hint_label.setWordWrap(True)
+        lg.addWidget(self.anchor_hint_label, 8, 0, 1, 3)
+        self.apply_layout_button = QPushButton("应用到全部页面")
+        self.apply_layout_button.clicked.connect(self._apply_layout_to_all_pages)
+        lg.addWidget(self.apply_layout_button, 9, 0, 1, 3)
+        self._home_size_mode_changed()
         lay.addWidget(lay_box)
 
         # 导出
@@ -1654,6 +1724,67 @@ class DemoWindow(QMainWindow):
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
         return wrap
+
+    def _home_size_mode_changed(self, *_args) -> None:
+        mode = self.size_mode_combo.currentData()
+        percent = mode == MODE_PERCENT
+        fixed = mode == MODE_FIXED
+        self.percent_label.setVisible(percent)
+        self.size_spin.setVisible(percent)
+        self.size_slider.setVisible(percent)
+        self.fixed_width_label.setVisible(fixed)
+        self.fixed_width_spin.setVisible(fixed)
+
+    @staticmethod
+    def _display_page_sizes(pdf: MockPdf) -> list[tuple[float, float]]:
+        """Return page sizes in the displayed orientation, in PDF points."""
+        if pdf.path and os.path.exists(pdf.path):
+            try:
+                import fitz
+                with fitz.open(pdf.path) as doc:
+                    return [(float(page.rect.width), float(page.rect.height))
+                            for page in doc]
+            except Exception:
+                pass
+        return [(float(PAGE_W), float(PAGE_H)) for _ in pdf.pages]
+
+    def _apply_layout_to_all_pages(self) -> None:
+        """Apply pending home controls to every document page explicitly."""
+        mode = self.size_mode_combo.currentData()
+        anchor_value = self.anchor_combo.currentData()
+        opacity = self.opacity_slider.value() / 100.0
+        for pdf in self.files:
+            page_sizes = self._display_page_sizes(pdf)
+            for page_index, st in enumerate(pdf.pages):
+                st.size_mode = mode
+                st.percent = float(self.size_spin.value())
+                st.fixed_width = self.fixed_width_spin.value()
+                st.opacity = opacity
+                if anchor_value == ANCHOR_KEEP:
+                    continue
+                page_w, page_h = page_sizes[page_index]
+                offsets: dict[int, tuple[float, float]] = {}
+                for image_index, image_path in enumerate(self._images):
+                    try:
+                        iw, ih = image_native_size(Path(image_path))
+                        centered = replace(
+                            st, dx=0.0, dy=0.0, image_offsets={})
+                        layout = replace(
+                            page_layout(centered, image_path=image_path,
+                                        native_size=(iw, ih)),
+                            anchor=Anchor(anchor_value),
+                        )
+                        x, y, width, height = rect_for(
+                            layout, page_w, page_h, iw, ih)
+                        offsets[image_index] = (
+                            x + width / 2.0 - page_w / 2.0,
+                            y + height / 2.0 - page_h / 2.0,
+                        )
+                    except Exception:
+                        continue
+                st.image_offsets = offsets
+        self.status_label.setText("已将布局应用到全部文档页面")
+        self.refresh_cards()
 
     # ---- 卡片区 ----
     def _rebuild_cards(self) -> None:
@@ -1808,10 +1939,8 @@ class DemoWindow(QMainWindow):
                         ox, oy = st.dx, st.dy
                     else:
                         ox, oy = st.image_offsets[img_idx]
-                    local = PageState(wm=True, dx=ox, dy=oy,
-                                      size_mode=st.size_mode,
-                                      percent=st.percent,
-                                      cm_w=st.cm_w, cm_h=st.cm_h)
+                    local = replace(st, wm=True, dx=ox, dy=oy,
+                                    opacity=1.0, image_offsets={})
                     per_img[img_idx] = page_layout(
                         local, image_path=self._images[img_idx])
                 page_image_layouts[idx] = per_img
