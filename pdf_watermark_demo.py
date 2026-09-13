@@ -43,9 +43,10 @@ from PySide6.QtWidgets import (
 
 from pdf_watermark_studio.core.engine import (
     Layout, SizeMode, rect_for,
-    render_page_bg, composite_watermark, export_pdf, list_pdf_pages,
+    render_page_bg, composite_watermark, list_pdf_pages,
     image_native_size,
 )
+from pdf_watermark_studio.core.export_jobs import export_unique_pdf
 
 PAGE_W, PAGE_H = 420, 297
 CARD_W, CARD_H = 340, int(340 * 297 / 420)
@@ -1795,7 +1796,6 @@ class DemoWindow(QMainWindow):
         self.progress.setValue(0)
         ok = 0
         for i, f in enumerate(real):
-            out = os.path.join(self._output_dir, "watermarked_" + f.name)
             # 每页每图独立布局：只导出 wm=True 的页；每张图使用自己的偏移
             page_image_layouts = {}
             for idx, st in enumerate(f.pages):
@@ -1816,8 +1816,10 @@ class DemoWindow(QMainWindow):
                         local, image_path=self._images[img_idx])
                 page_image_layouts[idx] = per_img
             try:
-                export_pdf(f.path, out, images=[Path(p) for p in self._images],
-                           page_image_layouts=page_image_layouts)
+                export_unique_pdf(
+                    f.path, self._output_dir, images=[Path(p) for p in self._images],
+                    page_image_layouts=page_image_layouts,
+                )
                 ok += 1
             except Exception as e:
                 self.status_label.setText(f"导出失败：{f.name}（{e}）")
