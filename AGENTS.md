@@ -5,6 +5,8 @@ Windows project: 戳个印, a PySide6 desktop PDF watermark application.
 ## Active code path
 - `pdf_watermark_demo.py` is the application entry point and the entry packaged by PyInstaller.
 - `pdf_watermark_studio/core/engine.py` provides PDF rendering, watermark geometry and export; keep this dependency.
+- `pdf_watermark_studio/core/export_jobs.py` publishes uniquely named outputs without overwriting existing files.
+- `pdf_watermark_studio/export_worker.py` runs batch exports with independent input snapshots, file-boundary cancellation and structured results. Only the GUI thread updates widgets; retain thread references until `QThread.finished`.
 - `pdf_watermark_studio/src/` contains application branding assets.
 - The app starts with an EMPTY document/watermark list; users add PDFs and images themselves. Root PDF/PNG files are user samples — never auto-discovered, never overwritten.
 
@@ -22,6 +24,7 @@ Windows project: 戳个印, a PySide6 desktop PDF watermark application.
 
 ## Verification
 - For headless GUI checks, set `QT_QPA_PLATFORM=offscreen` before creating QApplication.
+- Run `D:\pyprojects\miniconda\python.exe -B -m unittest discover -s tests -v` for temporary-fixture regression tests. Cover input identity, offset remapping, output safety, layout controls and export lifecycle after related changes.
 - `_demo_smoke4.py` asserts: empty startup, drag-drop import, PageGridDialog + titled dialog render, simulated drag (pt conversion + pixel-level stamp movement), fast-composite timing, and an export into a fresh temp directory. `_verify_align.py` pixel-compares preview vs export (WYSIWYG).
 - Do not overwrite sample PDFs or existing exports during tests.
 
