@@ -156,6 +156,11 @@ def run():
         # 9) 导出到临时目录（不覆盖任何现有文件）
         win._output_dir = str(TMP)
         win._export_real()
+        export_deadline = time.monotonic() + 15
+        while win._export_active and time.monotonic() < export_deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        assert not win._export_active, "后台导出超时"
         out = TMP / ("watermarked_" + Path(SAMPLE).name)
         assert out.exists(), f"导出失败: {list(TMP.iterdir())}"
         from PyPDF2 import PdfReader

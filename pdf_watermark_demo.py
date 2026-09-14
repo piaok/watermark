@@ -21,8 +21,10 @@
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
+import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import List, Optional
@@ -31,7 +33,8 @@ if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes as _wintypes
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt,
+                            QThread, QTimer)
 from PySide6.QtGui import (QColor, QIcon, QImage, QPainter, QPainterPath,
                            QPen, QPixmap)
 from PySide6.QtWidgets import (
@@ -40,6 +43,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
     QVBoxLayout, QWidget,
 )
+from shiboken6 import delete as delete_qt_object
 
 from pdf_watermark_studio.core.engine import (
     Anchor, Layout, SizeMode, rect_for,
@@ -47,6 +51,9 @@ from pdf_watermark_studio.core.engine import (
     image_native_size,
 )
 from pdf_watermark_studio.core.export_jobs import export_unique_pdf
+from pdf_watermark_studio.export_worker import (
+    BatchResult, ExportFailure, ExportJob, ExportWorker,
+)
 
 PAGE_W, PAGE_H = 420, 297
 CARD_W, CARD_H = 340, int(340 * 297 / 420)
@@ -1336,6 +1343,13 @@ class DemoWindow(QMainWindow):
         self._images: List[str] = []
         self._output_dir: Optional[str] = ""
         self.cards: List[PdfCard] = []
+        self._export_active = False
+        self._export_thread: Optional[QThread] = None
+        self._export_worker: Optional[ExportWorker] = None
+        self._export_cancel_event: Optional[threading.Event] = None
+        self._close_after_export = False
+        self._last_export_result: Optional[BatchResult] = None
+        self._exporter = export_unique_pdf
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -1355,6 +1369,7 @@ class DemoWindow(QMainWindow):
         self.card_scroll.setWidgetResizable(True)
         self.card_scroll.setStyleSheet(
             "QScrollArea{background:transparent;border:0;}")
+        self._export_edit_controls.append(self.card_scroll)
         self.cards_body = CardsBody(lambda: not self.files)
         self.flow = FlowLayout(self.cards_body, margin=4)
         self.card_scroll.setWidget(self.cards_body)
@@ -1381,10 +1396,16 @@ class DemoWindow(QMainWindow):
 
     # ---- 拖放导入：PDF / 图片直接拖进窗口 ----
     def dragEnterEvent(self, event) -> None:
+        if self._export_active:
+            event.ignore()
+            return
         if any(u.isLocalFile() for u in event.mimeData().urls()):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:
+        if self._export_active:
+            event.ignore()
+            return
         paths = [u.toLocalFile() for u in event.mimeData().urls()
                  if u.isLocalFile()]
         if not paths:
@@ -1396,6 +1417,8 @@ class DemoWindow(QMainWindow):
         event.acceptProposedAction()
 
     def _import_paths(self, pdfs: List[str], imgs: List[str]) -> None:
+        if self._export_active:
+            return
         added_pdf = added_img = 0
         if pdfs:
             existing = {f.path for f in self.files if f.path}
@@ -1592,6 +1615,7 @@ class DemoWindow(QMainWindow):
 
         # PDF 文档
         pdf_box = QGroupBox("PDF 文档")
+        self.pdf_box = pdf_box
         pb = QVBoxLayout(pdf_box)
         self.pdf_list = QListWidget()
         pb.addWidget(self.pdf_list)
@@ -1609,6 +1633,7 @@ class DemoWindow(QMainWindow):
 
         # 水印图片
         img_box = QGroupBox("水印图片（可选多张）")
+        self.img_box = img_box
         ib = QVBoxLayout(img_box)
         self.img_list = QListWidget()
         for p in self._images:
@@ -1628,6 +1653,7 @@ class DemoWindow(QMainWindow):
 
         # 图片摆放布局
         lay_box = QGroupBox("图片摆放布局")
+        self.layout_box = lay_box
         lg = QGridLayout(lay_box)
         lg.addWidget(QLabel("对齐方式"), 0, 0)
         self.anchor_combo = QComboBox()
@@ -1702,13 +1728,14 @@ class DemoWindow(QMainWindow):
         self.out_dir_label = QLabel("未选择输出目录")
         dir_row.addWidget(self.out_dir_label, 1)
         btn_dir = QPushButton("选择目录")
+        self.btn_dir = btn_dir
         btn_dir.clicked.connect(self._pick_dir)
         dir_row.addWidget(btn_dir)
         eb.addLayout(dir_row)
         self.btn_export = QPushButton("导出全部")
         self.btn_export.setObjectName("btn_primary")
         self.btn_export.setCursor(Qt.PointingHandCursor)
-        self.btn_export.clicked.connect(self._export_real)
+        self.btn_export.clicked.connect(self._on_export_button_clicked)
         eb.addWidget(self.btn_export)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -1716,6 +1743,13 @@ class DemoWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         eb.addWidget(self.status_label)
         lay.addWidget(exp_box)
+
+        self._export_edit_controls = [
+            self.pdf_box,
+            self.img_box,
+            self.layout_box,
+            self.btn_dir,
+        ]
 
         # 列表等关键控件给出最小高度，空间不足走滚动而不是挤压
         self.pdf_list.setMinimumHeight(110)
@@ -1750,6 +1784,8 @@ class DemoWindow(QMainWindow):
 
     def _apply_layout_to_all_pages(self) -> None:
         """Apply pending home controls to every document page explicitly."""
+        if self._export_active:
+            return
         mode = self.size_mode_combo.currentData()
         anchor_value = self.anchor_combo.currentData()
         opacity = self.opacity_slider.value() / 100.0
@@ -1816,6 +1852,8 @@ class DemoWindow(QMainWindow):
         self.cards_body.update()
 
     def open_grid(self, idx: int) -> None:
+        if self._export_active:
+            return
         if 0 <= idx < len(self.files):
             sel = self.img_list.currentRow() if self.img_list.count() else 0
             PageGridDialog(self.files[idx], self.refresh_cards,
@@ -1825,6 +1863,8 @@ class DemoWindow(QMainWindow):
 
     # ---- 左侧面板动作 ----
     def _add_pdfs(self) -> None:
+        if self._export_active:
+            return
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择 PDF 文件", "", "PDF 文件 (*.pdf)")
         if not files:
@@ -1845,6 +1885,8 @@ class DemoWindow(QMainWindow):
         self._rebuild_cards()
 
     def _remove_pdf_mock(self) -> None:
+        if self._export_active:
+            return
         rows = {i.row() for i in self.pdf_list.selectedIndexes()}
         if not rows:
             return
@@ -1854,10 +1896,14 @@ class DemoWindow(QMainWindow):
         self._rebuild_cards()
 
     def _clear_pdf_mock(self) -> None:
+        if self._export_active:
+            return
         self.files.clear()
         self._rebuild_cards()
 
     def _add_images(self) -> None:
+        if self._export_active:
+            return
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择水印图片", "",
             "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
@@ -1877,6 +1923,8 @@ class DemoWindow(QMainWindow):
         self.refresh_cards()
 
     def _remove_img_mock(self) -> None:
+        if self._export_active:
+            return
         removed_rows = {index.row() for index in self.img_list.selectedIndexes()}
         if not removed_rows:
             return
@@ -1905,16 +1953,71 @@ class DemoWindow(QMainWindow):
         self.refresh_cards()
 
     def _pick_dir(self) -> None:
+        if self._export_active:
+            return
         d = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if d:
             self._output_dir = os.path.normpath(d)
             self.out_dir_label.setText(self._output_dir)
 
+    def _on_export_button_clicked(self) -> None:
+        if self._export_active:
+            self._cancel_export()
+        else:
+            self._export_real()
+
+    def _build_export_jobs(self) -> tuple[ExportJob, ...]:
+        """Freeze all model input before any work enters the background thread."""
+        files_snapshot = copy.deepcopy([f for f in self.files if f.path])
+        images_snapshot = copy.deepcopy(list(self._images))
+        jobs: list[ExportJob] = []
+
+        for pdf in files_snapshot:
+            page_image_layouts = {}
+            preparation_error = ""
+            try:
+                for page_index, state in enumerate(pdf.pages):
+                    if not state.wm:
+                        continue
+                    per_image = {}
+                    for image_index, image_path in enumerate(images_snapshot):
+                        ox, oy = state.image_offsets.get(
+                            image_index, (state.dx, state.dy)
+                        )
+                        local = replace(
+                            state,
+                            wm=True,
+                            dx=ox,
+                            dy=oy,
+                            opacity=1.0,
+                            image_offsets={},
+                        )
+                        per_image[image_index] = page_layout(
+                            local, image_path=image_path
+                        )
+                    page_image_layouts[page_index] = per_image
+            except Exception as exc:
+                page_image_layouts = {}
+                preparation_error = str(exc) or type(exc).__name__
+
+            jobs.append(ExportJob(
+                name=pdf.name,
+                path=pdf.path,
+                images=tuple(images_snapshot),
+                page_image_layouts=page_image_layouts,
+                page_count=len(pdf.pages),
+                preparation_error=preparation_error,
+            ))
+        return tuple(jobs)
+
     def _export_real(self) -> None:
-        """真实导出：把每页的 wm/偏移/尺寸按 page_layouts 应用到真实 PDF。"""
-        real = [f for f in self.files if f.path and os.path.exists(f.path)]
-        if not real:
-            self.status_label.setText("没有可导出的真实 PDF（请先用“添加 PDF…”选择文件）")
+        """Start a snapshot-based batch export on a dedicated Qt worker thread."""
+        if self._export_active:
+            return
+        if not any(pdf.path for pdf in self.files):
+            self.status_label.setText(
+                "没有可导出的真实 PDF（请先用“添加 PDF…”选择文件）"
+            )
             return
         if not self._images:
             self.status_label.setText("请先添加至少一张水印图片")
@@ -1922,38 +2025,104 @@ class DemoWindow(QMainWindow):
         if not self._output_dir_ok():
             self.status_label.setText("请先选择输出目录")
             return
-        total = len(real)
-        self.progress.setRange(0, total)
+
+        jobs = self._build_export_jobs()
+        self._last_export_result = None
+        self._export_cancel_event = threading.Event()
+        self._export_thread = QThread(self)
+        self._export_worker = ExportWorker(
+            jobs,
+            str(self._output_dir),
+            self._export_cancel_event,
+            exporter=self._exporter,
+        )
+        self._export_worker.moveToThread(self._export_thread)
+        self._export_thread.started.connect(self._export_worker.run)
+        self._export_worker.progress.connect(self._on_export_progress)
+        self._export_worker.finished.connect(self._on_export_worker_finished)
+        self._export_worker.finished.connect(self._export_thread.quit)
+        self._export_worker.finished.connect(self._export_worker.deleteLater)
+        self._export_thread.finished.connect(self._on_export_thread_finished)
+        self._export_thread.finished.connect(self._export_thread.deleteLater)
+
+        total_pages = sum(max(1, job.page_count) for job in jobs)
+        self.progress.setRange(0, total_pages)
         self.progress.setValue(0)
-        ok = 0
-        for i, f in enumerate(real):
-            # 每页每图独立布局：只导出 wm=True 的页；每张图使用自己的偏移
-            page_image_layouts = {}
-            for idx, st in enumerate(f.pages):
-                if not st.wm:
-                    continue
-                per_img = {}
-                for img_idx in range(len(self._images)):
-                    if img_idx not in st.image_offsets:
-                        # 未单独调整过的图片用该页默认位置
-                        ox, oy = st.dx, st.dy
-                    else:
-                        ox, oy = st.image_offsets[img_idx]
-                    local = replace(st, wm=True, dx=ox, dy=oy,
-                                    opacity=1.0, image_offsets={})
-                    per_img[img_idx] = page_layout(
-                        local, image_path=self._images[img_idx])
-                page_image_layouts[idx] = per_img
-            try:
-                export_unique_pdf(
-                    f.path, self._output_dir, images=[Path(p) for p in self._images],
-                    page_image_layouts=page_image_layouts,
-                )
-                ok += 1
-            except Exception as e:
-                self.status_label.setText(f"导出失败：{f.name}（{e}）")
-            self.progress.setValue(i + 1)
-        self.status_label.setText(f"导出完成：{ok}/{total} → {self._output_dir}")
+        self.status_label.setText(f"正在导出：0/{len(jobs)}")
+        self._export_active = True
+        self._set_export_ui_active(True)
+        try:
+            self._export_thread.start()
+        except Exception as exc:
+            result = BatchResult(
+                total=len(jobs),
+                successes=(),
+                failures=(ExportFailure(
+                    "导出任务", str(exc) or type(exc).__name__
+                ),),
+                cancelled=False,
+            )
+            self._on_export_worker_finished(result)
+            if not self._export_thread.isRunning():
+                self._export_active = False
+                self._set_export_ui_active(False)
+                delete_qt_object(self._export_worker)
+                self._export_thread.deleteLater()
+                self._export_worker = None
+                self._export_thread = None
+                self._export_cancel_event = None
+
+    def _set_export_ui_active(self, active: bool) -> None:
+        for control in self._export_edit_controls:
+            control.setEnabled(not active)
+        self.setAcceptDrops(not active)
+        self.btn_export.setEnabled(True)
+        self.btn_export.setText("取消导出" if active else "导出全部")
+
+    def _cancel_export(self) -> None:
+        if not self._export_active or self._export_cancel_event is None:
+            return
+        self._export_cancel_event.set()
+        self.btn_export.setEnabled(False)
+        self.btn_export.setText("正在取消…")
+        self.status_label.setText("正在取消：当前文件完成后停止")
+
+    def _on_export_progress(self, done: int, total: int, name: str) -> None:
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(min(done, max(1, total)))
+        if not (self._export_cancel_event and self._export_cancel_event.is_set()):
+            self.status_label.setText(f"正在导出：{name}")
+
+    def _on_export_worker_finished(self, result: BatchResult) -> None:
+        self._last_export_result = result
+        successes = len(result.successes)
+        failures = len(result.failures)
+        if result.cancelled:
+            self.status_label.setText(
+                f"已取消：成功 {successes}/{result.total}，失败 {failures}"
+            )
+        else:
+            self.status_label.setText(
+                f"导出完成：成功 {successes}/{result.total}，失败 {failures}"
+            )
+
+    def _on_export_thread_finished(self) -> None:
+        self._export_active = False
+        self._set_export_ui_active(False)
+        self._export_worker = None
+        self._export_thread = None
+        self._export_cancel_event = None
+        if self._close_after_export:
+            self._close_after_export = False
+            QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event) -> None:
+        if self._export_active:
+            self._close_after_export = True
+            self._cancel_export()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _output_dir_ok(self) -> bool:
         d = getattr(self, "_output_dir", None)
