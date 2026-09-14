@@ -40,8 +40,8 @@ from PySide6.QtGui import (QColor, QIcon, QImage, QPainter, QPainterPath,
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLayout, QListWidget,
-    QMainWindow, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox,
-    QVBoxLayout, QWidget,
+    QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+    QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 from shiboken6 import delete as delete_qt_object
 
@@ -1192,7 +1192,7 @@ QToolTip {
 }
 QMessageBox { background: #121b2c; }
 QMessageBox QLabel { color: #dbe4f0; font-size: 12px; }
-QTextEdit {
+QTextEdit, QPlainTextEdit {
     background: #0d1524; color: #dbe4f0; border: 1px solid #21304b;
     border-radius: 8px; selection-background-color: #2a4a6e;
 }
@@ -1349,6 +1349,8 @@ class DemoWindow(QMainWindow):
         self._export_cancel_event: Optional[threading.Event] = None
         self._close_after_export = False
         self._last_export_result: Optional[BatchResult] = None
+        self._export_details_dialog: Optional[QDialog] = None
+        self._export_details_text: Optional[QPlainTextEdit] = None
         self._exporter = export_unique_pdf
 
         central = QWidget()
@@ -1741,7 +1743,13 @@ class DemoWindow(QMainWindow):
         self.progress.setRange(0, 100)
         eb.addWidget(self.progress)
         self.status_label = QLabel("就绪")
+        self.status_label.setWordWrap(True)
         eb.addWidget(self.status_label)
+        self.btn_export_details = QPushButton("导出详情")
+        self.btn_export_details.setObjectName("btn_export_details")
+        self.btn_export_details.setEnabled(False)
+        self.btn_export_details.clicked.connect(self._show_export_details)
+        eb.addWidget(self.btn_export_details)
         lay.addWidget(exp_box)
 
         self._export_edit_controls = [
@@ -2027,7 +2035,7 @@ class DemoWindow(QMainWindow):
             return
 
         jobs = self._build_export_jobs()
-        self._last_export_result = None
+        self._clear_export_result_ui()
         self._export_cancel_event = threading.Event()
         self._export_thread = QThread(self)
         self._export_worker = ExportWorker(
@@ -2078,6 +2086,9 @@ class DemoWindow(QMainWindow):
         self.setAcceptDrops(not active)
         self.btn_export.setEnabled(True)
         self.btn_export.setText("取消导出" if active else "导出全部")
+        self.btn_export_details.setEnabled(
+            not active and self._last_export_result is not None
+        )
 
     def _cancel_export(self) -> None:
         if not self._export_active or self._export_cancel_event is None:
@@ -2097,14 +2108,107 @@ class DemoWindow(QMainWindow):
         self._last_export_result = result
         successes = len(result.successes)
         failures = len(result.failures)
+        unprocessed = max(0, result.total - successes - failures)
         if result.cancelled:
             self.status_label.setText(
-                f"已取消：成功 {successes}/{result.total}，失败 {failures}"
+                f"已取消：成功 {successes}/{result.total}，失败 {failures}，"
+                f"未处理 {unprocessed}"
+            )
+        elif failures == 0 and successes == result.total:
+            self.status_label.setText(
+                f"导出完成：全部成功 {successes}/{result.total}，未处理 {unprocessed}"
+            )
+        elif successes == 0 and failures > 0:
+            self.status_label.setText(
+                f"导出失败：成功 0/{result.total}，失败 {failures}，"
+                f"未处理 {unprocessed}"
             )
         else:
             self.status_label.setText(
-                f"导出完成：成功 {successes}/{result.total}，失败 {failures}"
+                f"导出完成：成功 {successes}/{result.total}，失败 {failures}，"
+                f"未处理 {unprocessed}"
             )
+        self.btn_export_details.setEnabled(not self._export_active)
+
+    def _clear_export_result_ui(self) -> None:
+        self._last_export_result = None
+        self.btn_export_details.setEnabled(False)
+        dialog = self._export_details_dialog
+        self._export_details_dialog = None
+        self._export_details_text = None
+        if dialog is not None:
+            dialog.close()
+
+    @staticmethod
+    def _format_export_details(result: BatchResult) -> str:
+        successes = len(result.successes)
+        failures = len(result.failures)
+        unprocessed = max(0, result.total - successes - failures)
+        if result.cancelled:
+            state = "已取消"
+        elif failures == 0 and successes == result.total:
+            state = "全部成功"
+        elif successes == 0 and failures > 0:
+            state = "全部失败"
+        else:
+            state = "部分失败"
+
+        lines = [
+            f"状态：{state}",
+            f"总计：{result.total}",
+            f"成功：{successes}",
+            f"失败：{failures}",
+            f"未处理：{unprocessed}",
+        ]
+        if result.successes:
+            lines.extend(("", "成功文件："))
+            for success in result.successes:
+                lines.extend((success.name, f"  {success.output_path}"))
+        if result.failures:
+            lines.extend(("", "失败文件："))
+            for failure in result.failures:
+                lines.extend((failure.name, f"  {failure.error_text}"))
+        return "\n".join(lines)
+
+    def _on_export_details_destroyed(self, dialog: QDialog) -> None:
+        if self._export_details_dialog is dialog:
+            self._export_details_dialog = None
+            self._export_details_text = None
+
+    def _show_export_details(self) -> None:
+        result = self._last_export_result
+        if result is None or self._export_active:
+            return
+        if self._export_details_dialog is not None:
+            self._export_details_dialog.show()
+            self._export_details_dialog.raise_()
+            self._export_details_dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("导出详情")
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.resize(660, 420)
+        dialog.setMinimumSize(480, 300)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 12)
+        details = QPlainTextEdit(dialog)
+        details.setObjectName("export_details_text")
+        details.setReadOnly(True)
+        details.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        details.setPlainText(self._format_export_details(result))
+        layout.addWidget(details, 1)
+        close_button = QPushButton("关闭", dialog)
+        close_button.clicked.connect(dialog.close)
+        layout.addWidget(close_button, 0, Qt.AlignRight)
+
+        self._export_details_dialog = dialog
+        self._export_details_text = details
+        dialog.destroyed.connect(
+            lambda *_args, current=dialog:
+            self._on_export_details_destroyed(current)
+        )
+        dialog.show()
 
     def _on_export_thread_finished(self) -> None:
         self._export_active = False
