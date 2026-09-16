@@ -38,10 +38,10 @@ from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt,
 from PySide6.QtGui import (QColor, QIcon, QImage, QPainter, QPainterPath,
                            QPen, QPixmap)
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLayout, QListWidget,
-    QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QAbstractButton, QApplication, QComboBox, QDialog, QDoubleSpinBox,
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLayout,
+    QListWidget, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 from shiboken6 import delete as delete_qt_object
 
@@ -1010,6 +1010,7 @@ def srcdir() -> Path:
 # ---------------------------------------------------------------- 品牌视觉（首页与弹窗共用）
 APP_SLOGAN = "戳一下，不加班"
 POWERED_BY = "powered by 野草智能（Wild Field）"
+CONTACT_PHONE = "15620126846"
 
 
 class Brand:
@@ -1259,7 +1260,7 @@ class TitleButton(QPushButton):
 
 
 class TitleBar(QWidget):
-    """自绘深色标题栏（高约56px）：品牌图标+标题 + 关于/反馈 + 窗口按钮。
+    """自绘深色标题栏（高约56px）：品牌图标+标题 + 帮助/反馈 + 窗口按钮。
 
     拖动/贴边/双击最大化由 WM_NCHITTEST→HTCAPTION 原生处理；
     按钮区域保持 HTCLIENT，点击不受影响。
@@ -1295,11 +1296,11 @@ class TitleBar(QWidget):
             b.setObjectName("btn_ghost")
             return b
 
-        btn_about = ghost("关于", "版本信息")
-        btn_about.clicked.connect(window._show_about)
+        btn_help = ghost("帮助", "使用说明")
+        btn_help.clicked.connect(window._show_help)
         btn_feedback = ghost("反馈", "问题与建议")
         btn_feedback.clicked.connect(window._send_feedback)
-        lay.addWidget(btn_about)
+        lay.addWidget(btn_help)
         lay.addWidget(btn_feedback)
         spacer = QWidget()
         spacer.setFixedWidth(8)
@@ -1456,76 +1457,94 @@ class DemoWindow(QMainWindow):
             else:
                 self.refresh_cards()
 
-    # ---- 关于 / 反馈 ----
-    def _show_about(self) -> None:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("关于 戳个印")
-        dlg.setFixedWidth(360)
+    # ---- 帮助 / 反馈 ----
+    def _dialog_head(self, dlg: QDialog, title: str, subtitle: str) -> QVBoxLayout:
+        """弹窗统一头部：品牌图标 + 标题 + 副标题，返回内容区布局。"""
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(24, 20, 24, 16)
-        lay.setSpacing(6)
+        lay.setSpacing(8)
         head = QHBoxLayout()
         icon_lbl = QLabel()
         if Brand.icon() is not None:
             icon_lbl.setPixmap(Brand.icon().scaled(
-                52, 52, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                42, 42, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         head.addWidget(icon_lbl)
-        title_col = QVBoxLayout()
-        t = QLabel("戳个印")
-        t.setStyleSheet("font-size:17px;font-weight:600;color:#ffffff;")
-        s = QLabel(APP_SLOGAN)
+        head.addSpacing(12)
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        t = QLabel(title)
+        t.setStyleSheet("font-size:15px;font-weight:600;color:#ffffff;")
+        s = QLabel(subtitle)
         s.setStyleSheet("font-size:11px;color:#5c7089;")
-        title_col.addSpacing(2)
-        title_col.addWidget(t)
-        title_col.addWidget(s)
-        head.addSpacing(14)
-        head.addLayout(title_col)
+        col.addWidget(t)
+        col.addWidget(s)
+        head.addLayout(col)
         head.addStretch(1)
         lay.addLayout(head)
-        desc = QLabel("桌面版 PDF 图片水印工具\n预览与导出所见即所得，支持多文档、"
-                      "多水印图批量盖章。\n\n由野草智能（Wild Field）出品"
-                      f"\n{APP_SLOGAN}，向上生长，长出不凡")
-        desc.setWordWrap(True)
-        desc.setStyleSheet("font-size:12px;color:#aebdd2;line-height:150%;")
-        lay.addWidget(desc)
-        lay.addSpacing(8)
+        return lay
+
+    def _build_help_dialog(self) -> QDialog:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("帮助 戳个印")
+        dlg.setFixedWidth(420)
+        lay = self._dialog_head(dlg, "使用帮助", APP_SLOGAN)
+        steps = [
+            ("首页", "鼠标左键点击文档缩略图，进入文档详情。"),
+            ("文档详情", "在页面预览上点击鼠标右键，切换「添加本页图章 / "
+                         "删除本页图章」。"),
+            ("文档详情", "在页面预览上按住鼠标左键，即可移动图章。"),
+            ("文档详情", "在空白位置点击鼠标右键，返回首页。"),
+        ]
+        for i, (where, text) in enumerate(steps, 1):
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            no = QLabel(str(i))
+            no.setFixedSize(20, 20)
+            no.setAlignment(Qt.AlignCenter)
+            no.setStyleSheet("background:#1d2942;border-radius:10px;"
+                             "color:#8ba0b8;font-size:11px;font-weight:600;")
+            row.addWidget(no, 0, Qt.AlignTop)
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            tag = QLabel(where)
+            tag.setStyleSheet("font-size:11px;color:#8ba0b8;")
+            body = QLabel(text)
+            body.setWordWrap(True)
+            body.setStyleSheet("font-size:12px;color:#c7d2e0;")
+            col.addWidget(tag)
+            col.addWidget(body)
+            row.addLayout(col, 1)
+            lay.addLayout(row)
         btn = QPushButton("知道了")
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn, 0, Qt.AlignRight)
-        dlg.exec()
+        return dlg
 
-    def _send_feedback(self) -> None:
+    def _show_help(self) -> None:
+        self._build_help_dialog().exec()
+
+    def _build_feedback_dialog(self) -> QDialog:
         dlg = QDialog(self)
         dlg.setWindowTitle("反馈")
-        dlg.setFixedWidth(360)
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(24, 20, 24, 16)
-        lay.setSpacing(10)
-        head = QHBoxLayout()
-        icon_lbl = QLabel()
-        if Brand.icon() is not None:
-            icon_lbl.setPixmap(Brand.icon().scaled(
-                44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        head.addWidget(icon_lbl)
-        t = QLabel("遇到问题或有建议？")
-        t.setStyleSheet("font-size:14px;font-weight:600;color:#ffffff;")
-        head.addSpacing(10)
-        head.addWidget(t)
-        head.addStretch(1)
-        lay.addLayout(head)
-        body = QLabel("欢迎联系野草智能（Wild Field）反馈：\n"
-                      "QQ：346869673")
+        dlg.setFixedWidth(400)
+        lay = self._dialog_head(dlg, "遇到问题或有建议？", "欢迎随时联系我们")
+        body = QLabel("软件由野草智能开发，如有问题请联系：")
         body.setWordWrap(True)
         body.setStyleSheet("font-size:12px;color:#aebdd2;")
         lay.addWidget(body)
+        phone = QLabel(CONTACT_PHONE)
+        phone.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        phone.setStyleSheet("font-size:19px;font-weight:600;color:#38bdf8;"
+                            "letter-spacing:1px;")
+        lay.addWidget(phone)
         copied = QLabel("")
         copied.setStyleSheet("color:#38bdf8;font-size:11px;")
         row = QHBoxLayout()
         row.addWidget(copied, 1)
-        btn_copy = QPushButton("复制 QQ 号")
+        btn_copy = QPushButton("复制手机号")
 
         def do_copy() -> None:
-            QApplication.clipboard().setText("346869673")
+            QApplication.clipboard().setText(CONTACT_PHONE)
             copied.setText("已复制到剪贴板")
 
         btn_copy.clicked.connect(do_copy)
@@ -1534,7 +1553,10 @@ class DemoWindow(QMainWindow):
         row.addWidget(btn_copy)
         row.addWidget(btn_close)
         lay.addLayout(row)
-        dlg.exec()
+        return dlg
+
+    def _send_feedback(self) -> None:
+        self._build_feedback_dialog().exec()
 
     # ---- 无边框窗口：原生拖动/缩放/贴边（Windows） ----
     def toggle_maximized(self) -> None:
@@ -1589,10 +1611,10 @@ class DemoWindow(QMainWindow):
             if b:
                 return HTBOTTOM
         if self.title_bar.geometry().contains(pos):
-            child = self.childAt(pos)
-            if child not in (self.title_bar.btn_min,
-                             self.title_bar.btn_max,
-                             self.title_bar.btn_close):
+            # 标题栏空白区返回 HTCAPTION 交给系统拖动/双击最大化；
+            # 标题栏内的按钮必须留在 HTCLIENT，否则物理点击会被系统
+            # 当成拖动标题栏吞掉，Qt 收不到 press，按钮点了没反应。
+            if not isinstance(self.childAt(pos), QAbstractButton):
                 return HTCAPTION
         return None
 

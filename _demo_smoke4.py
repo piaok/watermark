@@ -13,14 +13,14 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, r"D:\pyprojects\watermark")
 
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea
 from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtGui import QImage
 
 app = QApplication.instance() or QApplication([])
 from pdf_watermark_demo import (DemoWindow, PageGridDialog, MockPdf,
                                 make_pages, MODE_PERCENT, MODE_CM,
-                                MODE_ORIGINAL, PageTile)
+                                MODE_ORIGINAL, PageTile, CONTACT_PHONE)
 
 ROOT = Path(r"D:\pyprojects\watermark")
 SAMPLE = str(ROOT / "8号线一期南沂区间消防设计说明 (3).pdf")
@@ -72,10 +72,29 @@ def run():
         win = DemoWindow()
         win.show()
 
-        # 0) 顶栏：自绘深色标题栏（含 关于/反馈 + 窗口按钮）
+        # 0) 顶栏：自绘深色标题栏（含 帮助/反馈 + 窗口按钮）
         assert win.title_bar.height() == 44, "标题栏高度应为 44px"
-        assert hasattr(win, "_show_about") and hasattr(win, "_send_feedback")
+        assert hasattr(win, "_show_help") and hasattr(win, "_send_feedback")
         assert hasattr(win.title_bar, "btn_min")
+
+        # 0b) 帮助/反馈弹窗可渲染，正文与需求一致
+        help_dlg = win._build_help_dialog()
+        help_dlg.show()
+        app.processEvents()
+        help_text = " ".join(l.text() for l in help_dlg.findChildren(QLabel))
+        for kw in ("文档缩略图", "添加本页图章", "删除本页图章",
+                   "按住鼠标左键", "空白位置点击鼠标右键"):
+            assert kw in help_text, f"帮助弹窗缺少「{kw}」"
+        help_dlg.close()
+
+        fb_dlg = win._build_feedback_dialog()
+        fb_dlg.show()
+        app.processEvents()
+        fb_text = " ".join(l.text() for l in fb_dlg.findChildren(QLabel))
+        assert "野草智能" in fb_text and CONTACT_PHONE in fb_text, \
+            f"反馈弹窗文案异常: {fb_text}"
+        fb_dlg.close()
+        app.processEvents()
 
         # 1) 默认空白：无文档、无水印图、无卡片
         assert win.files == [] and win._images == [], "默认应为空白"

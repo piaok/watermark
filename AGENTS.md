@@ -24,8 +24,9 @@ Windows project: 戳个印, a PySide6 desktop PDF watermark application.
 
 ## Verification
 - For headless GUI checks, set `QT_QPA_PLATFORM=offscreen` before creating QApplication.
-- Run `D:\pyprojects\miniconda\python.exe -B -m unittest discover -s tests -v` for temporary-fixture regression tests. Cover input identity, offset remapping, output safety, layout controls and export lifecycle after related changes.
-- `_demo_smoke4.py` asserts: empty startup, drag-drop import, PageGridDialog + titled dialog render, simulated drag (pt conversion + pixel-level stamp movement), fast-composite timing, and an export into a fresh temp directory. `_verify_align.py` pixel-compares preview vs export (WYSIWYG).
+- Run `D:\pyprojects\miniconda\python.exe -B -m unittest discover -s tests -v` for temporary-fixture regression tests. Cover input identity, offset remapping, output safety, layout controls, export lifecycle and help/feedback dialog copy after related changes.
+- `_demo_smoke4.py` asserts: empty startup, drag-drop import, help/feedback dialog render, PageGridDialog + titled dialog render, simulated drag (pt conversion + pixel-level stamp movement), fast-composite timing, and an export into a fresh temp directory. `_verify_align.py` pixel-compares preview vs export (WYSIWYG).
+- Title bar entries are `帮助` (`DemoWindow._show_help`) and `反馈` (`DemoWindow._send_feedback`); both dialogs are built by `_build_help_dialog` / `_build_feedback_dialog` so headless tests can inspect them without `exec()`. Keep the help text in sync with the real interactions: left click a home thumbnail to open the document, right click a page preview to add/remove that page's stamp, hold left button on a preview to move the stamp, right click blank space to return home.
 - Do not overwrite sample PDFs or existing exports during tests.
 
 The former Ollama/OpenCode components, standalone add_watermark.py, and unused Studio GUI have been removed. They are not part of this application.
