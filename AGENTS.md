@@ -20,7 +20,7 @@ Windows project: 戳个印, a PySide6 desktop PDF watermark application.
 - Runtime env: `D:\pyprojects\miniconda\python.exe` (Python 3.13, has deps). The default `py` launcher is Python 3.8 without deps.
 - Install runtime dependencies: `python -m pip install -r requirements.txt`.
 - Start: `python pdf_watermark_demo.py`.
-- Packaging uses PyInstaller: `pip install pyinstaller`, then `python build_exe.py` (onefile → `dist/戳个印.exe`; workpath/spec live under `build_assets/`, regenerable).
+- Packaging uses PyInstaller: `pip install pyinstaller`, then `python build_exe.py` (onefile → `dist/戳个印.exe`, ~52 MB; workpath/payload/spec live under `build_assets/`, regenerable). The script generates its own spec and applies size filters — keep them all: conda `Library\bin` DLL injection (`_ctypes.pyd` → `ffi.dll`, else the exe dies at startup on Anaconda Python 3.13); drops of unused Qt modules (Quick/Qml/Pdf/Network/Svg/OpenGL), `opengl32sw`, Qt translations, PIL AVIF, tkinter/sqlite3; and numpy/pandas/lxml (only reachable via `pymupdf.table` lazy imports). Re-enable numpy/pandas/lxml if `pymupdf.find_tables` is ever used.
 
 ## Verification
 - For headless GUI checks, set `QT_QPA_PLATFORM=offscreen` before creating QApplication.
