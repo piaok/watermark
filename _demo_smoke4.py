@@ -9,6 +9,7 @@ import time
 import tempfile
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, r"D:\pyprojects\watermark")
@@ -18,6 +19,7 @@ from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtGui import QImage
 
 app = QApplication.instance() or QApplication([])
+import pdf_watermark_demo as demo
 from pdf_watermark_demo import (DemoWindow, PageGridDialog, MockPdf,
                                 make_pages, MODE_PERCENT, MODE_CM,
                                 MODE_ORIGINAL, PageTile, CONTACT_PHONE)
@@ -121,6 +123,60 @@ def run():
         assert win.files[0].pages[0].wm is True
         pix_on = tile._pix.toImage().bits().tobytes() if tile._pix.toImage().bits() else None
         assert pix_on is not None
+
+        # 4b) 瓦片「全屏」角标打开单页全屏视图
+        with patch.object(demo.FullScreenPageDialog, "exec",
+                          lambda self: 0):
+            dlg.open_fullscreen(1)   # 打开第 2 页全屏
+        app.processEvents()
+        assert win.files[0].pages[1].wm is False
+
+        # 4c) 单页全屏视图：页码 + 翻页 + 滚轮 + 右键切换 + 左键拖动
+        fs = demo.FullScreenPageDialog(
+            win.files[0], win.refresh_cards, image_paths=win._images,
+            selected_image_index=0, page=0)
+        fs.show()
+        app.processEvents()
+        assert "第 1 / 2 页" in fs.page_label.text()
+        st0 = win.files[0].pages[0]
+        st0.wm = True
+        st0.size_mode = MODE_PERCENT
+        st0.percent = 30.0
+        fs._rerender()
+        base_percent = st0.percent
+        fs.adjust_stamp_size(3)
+        assert st0.percent == base_percent + 6.0, "滚轮应调节图章大小"
+        assert fs.btn_prev.isEnabled() is False and fs.btn_next.isEnabled()
+        fs.btn_next.click()
+        assert fs.current_page == 1
+        assert fs.btn_next.isEnabled() is False
+        fs.btn_prev.click()
+        assert fs.current_page == 0
+        # 右键页面中心：切换图章
+        rect = fs._page_rect()
+        wm_before = st0.wm
+        fs.mousePressEvent(FakeEv(rect.center().x(), rect.center().y(),
+                                  Qt.RightButton))
+        app.processEvents()
+        assert st0.wm != wm_before, "全屏右键应切换本页图章"
+        st0.wm = True
+        fs._rerender()
+        # 左键拖动：与网格同一 pt 换算
+        k = fs._pt_per_px()
+        assert k is not None and 0 < k < 50
+        fs.mousePressEvent(FakeEv(rect.center().x(), rect.center().y()))
+        fs.mouseMoveEvent(FakeEv(rect.center().x() + 30,
+                                 rect.center().y() + 12))
+        fs.mouseReleaseEvent(FakeEv(rect.center().x() + 30,
+                                    rect.center().y() + 12))
+        ox, oy = st0.image_offsets[0]
+        assert abs(ox - 30 * k) < 0.5 and abs(oy - 12 * k) < 0.5, \
+            f"全屏拖动偏移 {ox, oy} != 预期 {(30 * k, 12 * k)}"
+        # 还原第 1 页初始状态（后续网格拖动用例以 (0,0) 为基准）
+        st0.image_offsets.clear()
+        st0.dx = st0.dy = 0.0
+        fs.close()
+        app.processEvents()
 
         # 5) 模拟左键拖动：40,10 控件像素 → 应按 pt 换算写入
         k = dlg._pt_per_px(0)

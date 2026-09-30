@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2 import PdfReader
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
@@ -221,99 +221,138 @@ def export_pdf(pdf_path: str, output_path: str, layout: Optional[Layout] = None,
     - layout.rotate_per_page 为 True 时，每页循环取一张图片；
     - 否则在一页里按顺序叠放全部图片。
     progress_cb(done_pages, total_pages) 可选，导出过程中循环调用。
+
+    实现说明（性能关键，勿改回逐页 PyPDF2 merge）：
+    - 全部水印页先画进一个 reportlab「薄覆盖层」PDF：同一张水印图
+      在覆盖层内只嵌入一次（XObject 跨页共享），几百页的导出产物
+      体积不再随页数线性膨胀。
+    - 再用 PyMuPDF show_pdf_page 把覆盖层页合并到源页（overlay=True
+      画在原内容之上）。整条链路都在 C 层完成，替代此前 PyPDF2
+      纯 Python 的逐页 merge_page（每页 0.5~1s，长文档表现为「卡死」）。
+    - /Rotate 页保持既有约定：布局矩形以显示方向为基准，覆盖层仍按
+      未旋转 mediabox 空间绘制（绘制时手工逆变换），合并矩形亦取
+      未旋转 mediabox，与旧实现的像素结果逐位一致（_verify_align 覆盖）。
     """
     if images is None:
         images = []
     if layout is None:
         layout = Layout()
 
-    reader = PdfReader(pdf_path)
-    writer = PdfWriter()
-    n_pages = len(reader.pages)
-    allowed = layout.pages_filter  # Optional[set[int]] 0基索引；None=全部
+    import fitz
 
-    for page_index in range(n_pages):
-        if progress_cb:
-            progress_cb(page_index, n_pages)
-        page = reader.pages[page_index]
+    doc = fitz.open(pdf_path)
+    try:
+        n_pages = doc.page_count
+        allowed = layout.pages_filter  # Optional[set[int]] 0基；None=全部
+        native_cache: dict[str, tuple[int, int]] = {}
 
-        # ---- 选定本页各图布局 ----
-        if page_image_layouts is not None:
-            per_img = page_image_layouts.get(page_index)
-            if not per_img:
-                writer.add_page(page)      # 该页不加任何水印
-                continue
-            pairs = [(images[i] if i < len(images) else None, lay)
-                     for i, lay in per_img.items()]
-            pairs = [(p, l) for p, l in pairs if p is not None]
-        elif page_layouts is not None:
-            page_layout = page_layouts.get(page_index)
-            if page_layout is None:
-                writer.add_page(page)      # 该页不加任何水印
-                continue
-            pairs = [(p, page_layout) for p in images]
-        else:
-            page_layout = layout
-            if allowed is not None and page_index not in allowed:
-                writer.add_page(page)      # 页面过滤：跳过不应用水印的页
-                continue
-            if page_layout.rotate_per_page:
-                pairs = [(images[page_index % len(images)], page_layout)] if images else []
-            else:
-                pairs = [(p, page_layout) for p in images]
+        def _native(path) -> tuple[int, int]:
+            key = str(path)
+            if key not in native_cache:
+                native_cache[key] = image_native_size(path)
+            return native_cache[key]
 
-        mb = page.mediabox
-        page_w = float(mb.width)
-        page_h = float(mb.height)
-        # 页面旋转属性（0/90/180/270）。预览（fitz）按显示方向渲染，
-        # 因此布局矩形以「显示方向」为基准，绘制时逆变换回未旋转坐标。
-        try:
-            rot = int(page.get("/Rotate", 0) or 0) % 360
-        except Exception:
-            rot = 0
-        disp_w, disp_h = ((page_h, page_w) if rot in (90, 270)
-                          else (page_w, page_h))
-
-        # ---- 生成覆盖层 PDF（reportlab）----
+        # ---- 第一遍：确定每页水印组合并绘制薄覆盖层 ----
+        page_pairs: list[list[tuple]] = []
+        overlay_index_of: dict[int, int] = {}
         packet = io.BytesIO()
-        c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+        c = canvas.Canvas(packet)
+        overlay_count = 0
 
-        for img_path, img_layout in pairs:
-            iw, ih = image_native_size(img_path)
-            # 显示方向坐标系（左上原点）中的矩形
-            x, y, w, h = rect_for(img_layout, disp_w, disp_h, iw, ih)
-            c.saveState()
-            if rot == 0:
-                # reportlab 坐标：从左下原点，因此 y_bottom = page_h - y_tl - h
-                c.drawImage(str(img_path), x, page_h - y - h, width=w,
-                            height=h, mask="auto")
-            elif rot == 90:
-                c.translate(y + h, x)
-                c.rotate(90)
-                c.drawImage(str(img_path), 0, 0, width=w, height=h,
-                            mask="auto")
-            elif rot == 180:
-                c.translate(page_w - x, page_h - y)
-                c.rotate(180)
-                c.drawImage(str(img_path), 0, 0, width=w, height=h,
-                            mask="auto")
-            else:  # 270
-                c.translate(page_w - y - h, page_h - x)
-                c.rotate(-90)
-                c.drawImage(str(img_path), 0, 0, width=w, height=h,
-                            mask="auto")
-            c.restoreState()
+        for page_index in range(n_pages):
+            if progress_cb:
+                progress_cb(page_index, n_pages)
+            page = doc[page_index]
+
+            # ---- 选定本页各图布局（与旧实现逐分支一致） ----
+            if page_image_layouts is not None:
+                per_img = page_image_layouts.get(page_index)
+                if not per_img:
+                    page_pairs.append([])
+                    continue
+                pairs = [(images[i] if i < len(images) else None, lay)
+                         for i, lay in per_img.items()]
+                pairs = [(p, l) for p, l in pairs if p is not None]
+            elif page_layouts is not None:
+                page_layout = page_layouts.get(page_index)
+                if page_layout is None:
+                    page_pairs.append([])
+                    continue
+                pairs = [(p, page_layout) for p in images]
+            else:
+                page_layout = layout
+                if allowed is not None and page_index not in allowed:
+                    page_pairs.append([])
+                    continue
+                if page_layout.rotate_per_page:
+                    pairs = ([(images[page_index % len(images)], page_layout)]
+                             if images else [])
+                else:
+                    pairs = [(p, page_layout) for p in images]
+            page_pairs.append(pairs)
+            if not pairs:
+                continue
+
+            mb = page.mediabox
+            page_w = float(mb.width)
+            page_h = float(mb.height)
+            # 页面旋转属性（0/90/180/270）。预览（fitz）按显示方向渲染，
+            # 因此布局矩形以「显示方向」为基准，绘制时逆变换回未旋转坐标。
+            rot = int(page.rotation or 0) % 360
+            disp_w, disp_h = ((page_h, page_w) if rot in (90, 270)
+                              else (page_w, page_h))
+
+            c.setPageSize((page_w, page_h))
+            for img_path, img_layout in pairs:
+                iw, ih = _native(img_path)
+                # 显示方向坐标系（左上原点）中的矩形
+                x, y, w, h = rect_for(img_layout, disp_w, disp_h, iw, ih)
+                c.saveState()
+                if rot == 0:
+                    # reportlab 坐标：从左下原点，因此 y_bottom = page_h - y_tl - h
+                    c.drawImage(str(img_path), x, page_h - y - h, width=w,
+                                height=h, mask="auto")
+                elif rot == 90:
+                    c.translate(y + h, x)
+                    c.rotate(90)
+                    c.drawImage(str(img_path), 0, 0, width=w, height=h,
+                                mask="auto")
+                elif rot == 180:
+                    c.translate(page_w - x, page_h - y)
+                    c.rotate(180)
+                    c.drawImage(str(img_path), 0, 0, width=w, height=h,
+                                mask="auto")
+                else:  # 270
+                    c.translate(page_w - y - h, page_h - x)
+                    c.rotate(-90)
+                    c.drawImage(str(img_path), 0, 0, width=w, height=h,
+                                mask="auto")
+                c.restoreState()
+            c.showPage()
+            overlay_index_of[page_index] = overlay_count
+            overlay_count += 1
         c.save()
 
-        # ---- 合并覆盖层到当前页 ----
-        packet.seek(0)
-        overlay_reader = PdfReader(packet)
-        overlay_page = overlay_reader.pages[0]
-        page.merge_page(overlay_page)
-        writer.add_page(page)
+        # ---- 第二遍：fitz 将覆盖层合并到源页并写出 ----
+        if overlay_count:
+            packet.seek(0)
+            overlay = fitz.open(stream=packet.read(), filetype="pdf")
+            try:
+                for page_index, ov_index in overlay_index_of.items():
+                    page = doc[page_index]
+                    mb = page.mediabox
+                    page.show_pdf_page(
+                        fitz.Rect(0.0, 0.0, float(mb.width), float(mb.height)),
+                        overlay, ov_index, overlay=True,
+                    )
+            finally:
+                overlay.close()
+        data = doc.tobytes(garbage=1, deflate=True)
+    finally:
+        doc.close()
 
     with open(output_path, "wb") as f:
-        writer.write(f)
+        f.write(data)
 
 
 def merge_overlay(page, overlay_pdf_bytes: bytes):

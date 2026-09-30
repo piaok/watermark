@@ -8,7 +8,10 @@
 4. 弹出窗口：所有页面按 3 列连续平铺，页面多于 9 页时靠右侧垂直滚动条查看；
    水印大小含「页面宽度百分比」与「原始尺寸」两种模式，放大/缩小只影响当前页。
 5. 首页卡片排满自动换行（FlowLayout），不再无限横向延伸。
-6. 点击页面只改变选中高亮，不改变页面预览图尺寸（无跳变）。
+6. 页面网格（第二级视图）内左键点击页面 = 进入该页全屏；按住左键拖动 =
+   移动图章（拖动阈值 3px 区分点击与拖动）。
+7. 页面预览右上角「全屏」角标同样进入单页全屏视图：交互与预览一致
+   （右键切换、左键拖动），滚轮调节图章大小，左右悬浮按钮/方向键翻页。
 
 坐标约定（所见即所得的关键）：
 - PageState.dx/dy 与 image_offsets 一律以 PDF 点（pt，72dpi）为单位，
@@ -34,14 +37,15 @@ if sys.platform == "win32":
     from ctypes import wintypes as _wintypes
 
 from PySide6.QtCore import (QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt,
-                            QThread, QTimer)
-from PySide6.QtGui import (QColor, QIcon, QImage, QPainter, QPainterPath,
-                           QPen, QPixmap)
+                            QStandardPaths, QThread, QTimer)
+from PySide6.QtGui import (QColor, QCursor, QIcon, QImage, QPainter,
+                           QPainterPath, QPen, QPixmap)
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QComboBox, QDialog, QDoubleSpinBox,
-    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLayout,
-    QListWidget, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+    QLayout, QLineEdit, QListWidget, QMainWindow, QPlainTextEdit,
+    QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 from shiboken6 import delete as delete_qt_object
 
@@ -395,8 +399,8 @@ class PdfCard(QWidget):
 class PageTile(QWidget):
     """弹窗内单页瓦片：固定预览尺寸；选中只改边框不改尺寸。
 
-    交互：右键切换水印；左键拖动移动当前选中图片在本页的位置；
-    左键按下选中当前页。
+    交互：左键单击进入该页全屏视图；按住左键拖动移动当前选中图片
+    在本页的位置；右键切换水印；左键按下同时选中当前页。
     """
 
     TILE_W, TILE_H = 300, 210        # 更大，铺满窗口换排
@@ -410,6 +414,7 @@ class PageTile(QWidget):
         self.dragging = False
         self.active = False
         self._pix = None
+        self._chip_hover = False
         self.setFixedSize(PageTile.TILE_W + 24, PageTile.TILE_H + 48)
         self.setMouseTracking(True)
 
@@ -423,6 +428,10 @@ class PageTile(QWidget):
                              Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._pix = pix
         self.update()
+
+    def _fullscreen_chip_rect(self) -> QRectF:
+        """瓦片右上角「全屏」角标的命中区域（控件坐标）。"""
+        return QRectF(self.width() - 58, 6, 50, 22)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
@@ -450,6 +459,17 @@ class PageTile(QWidget):
         painter.setPen(QColor("#6f839c"))
         painter.drawText(QRectF(0, h - 26, w, 18), Qt.AlignCenter,
                          f"第 {self.page + 1} 页")
+        # 「全屏」角标（悬停变印章红，与首页「放大」角标同款）
+        chip = self._fullscreen_chip_rect()
+        hovered = self._chip_hover
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#b93a4e" if hovered else "#0d1524"))
+        painter.drawRoundedRect(chip, 7, 7)
+        painter.setPen(QPen(QColor("#b93a4e" if hovered else "#35496e"), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(chip, 7, 7)
+        painter.setPen(QColor("white" if hovered else "#c7d2e0"))
+        painter.drawText(chip, Qt.AlignCenter, "全屏")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
@@ -457,12 +477,19 @@ class PageTile(QWidget):
             self.overlay.toggle_page(self.page)
             return
         if event.button() == Qt.LeftButton:
+            if self._fullscreen_chip_rect().contains(event.position()):
+                self.overlay.open_fullscreen(self.page)
+                return
             self.overlay.set_current(self.page)
             self.press = QPointF(event.position())
             self.dragging = False
 
     def mouseMoveEvent(self, event) -> None:
         if self.press is None:
+            hovered = self._fullscreen_chip_rect().contains(event.position())
+            if hovered != self._chip_hover:
+                self._chip_hover = hovered
+                self.update()
             return
         dx = event.position().x() - self.press.x()
         dy = event.position().y() - self.press.y()
@@ -487,15 +514,60 @@ class PageTile(QWidget):
         # 高频拖动：只重绘当前页（Qt 缓存合成，避免全量重渲染的滞涩）
         self.overlay.rerender_tile(self.page)
 
+    def leaveEvent(self, _event) -> None:
+        if self._chip_hover:
+            self._chip_hover = False
+            self.update()
+
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton and self.press is not None:
             if self.dragging:
                 self.overlay.on_change()
+            else:
+                # 左键单击（未拖动）：进入该页全屏视图
+                self.overlay.open_fullscreen(self.page)
             self.press = None
             self.dragging = False
 
 
 # ---------------------------------------------------------------- 全屏弹窗
+def build_dialog_titlebar(title: str, subtitle: str, on_close) -> QWidget:
+    """弹窗统一标题栏（深色 44px）：品牌图标 + 标题 + 副标题 + 关闭按钮。"""
+    bar = QWidget()
+    bar.setObjectName("dlgTitleBar")
+    bar.setFixedHeight(44)
+    lay = QHBoxLayout(bar)
+    lay.setContentsMargins(16, 0, 4, 0)
+    lay.setSpacing(10)
+    icon_lbl = QLabel()
+    icon_lbl.setFixedSize(20, 20)
+    if Brand.icon() is not None:
+        icon_lbl.setPixmap(Brand.icon().scaled(
+            20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    lay.addWidget(icon_lbl)
+    title_lbl = QLabel(title)
+    title_lbl.setStyleSheet("color:#e8eef7;font-size:13px;font-weight:600;"
+                            "background:transparent;")
+    lay.addWidget(title_lbl)
+    sub = QLabel(subtitle)
+    sub.setObjectName("dlg_subtitle")
+    sub.setStyleSheet("color:#5c7089;font-size:11px;background:transparent;")
+    lay.addWidget(sub)
+    lay.addStretch(1)
+    close_btn = TitleButton(TitleButton.CLOSE, "关闭")
+    close_btn.clicked.connect(on_close)
+    lay.addWidget(close_btn)
+    bar.setStyleSheet(
+        "QWidget#dlgTitleBar{background:#0b1220;"
+        "border-bottom:1px solid #18233a;}"
+        "QWidget#dlgTitleBar QLabel{background:transparent;border:0;}"
+        "QWidget#dlgTitleBar QPushButton{background:transparent;"
+        "color:#8ba0b8;border:0;border-radius:6px;font-size:12px;}"
+        "QWidget#dlgTitleBar QPushButton:hover{background:#1d2a42;"
+        "color:#dbe4f0;}")
+    return bar
+
+
 class PageGridDialog(QDialog):
     """全屏页面查看：左侧水印图片选择 + 右侧页面网格（自动换排）。"""
 
@@ -623,38 +695,8 @@ class PageGridDialog(QDialog):
 
     # ---- 弹窗标题栏（与首页同款，深色 44px） ----
     def _build_dialog_titlebar(self) -> QWidget:
-        bar = QWidget()
-        bar.setObjectName("dlgTitleBar")
-        bar.setFixedHeight(44)
-        lay = QHBoxLayout(bar)
-        lay.setContentsMargins(16, 0, 4, 0)
-        lay.setSpacing(10)
-        icon_lbl = QLabel()
-        icon_lbl.setFixedSize(20, 20)
-        if Brand.icon() is not None:
-            icon_lbl.setPixmap(Brand.icon().scaled(
-                20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        lay.addWidget(icon_lbl)
-        title = QLabel(self.pdf.name)
-        title.setStyleSheet("color:#e8eef7;font-size:13px;font-weight:600;"
-                            "background:transparent;")
-        lay.addWidget(title)
-        sub = QLabel(f"·  {len(self.pdf.pages)} 页")
-        sub.setStyleSheet("color:#5c7089;font-size:11px;background:transparent;")
-        lay.addWidget(sub)
-        lay.addStretch(1)
-        close_btn = TitleButton(TitleButton.CLOSE, "关闭")
-        close_btn.clicked.connect(self.close)
-        lay.addWidget(close_btn)
-        bar.setStyleSheet(
-            "QWidget#dlgTitleBar{background:#0b1220;"
-            "border-bottom:1px solid #18233a;}"
-            "QWidget#dlgTitleBar QLabel{background:transparent;border:0;}"
-            "QWidget#dlgTitleBar QPushButton{background:transparent;"
-            "color:#8ba0b8;border:0;border-radius:6px;font-size:12px;}"
-            "QWidget#dlgTitleBar QPushButton:hover{background:#1d2a42;"
-            "color:#dbe4f0;}")
-        return bar
+        return build_dialog_titlebar(self.pdf.name, f"·  {len(self.pdf.pages)} 页",
+                                     self.close)
 
     # ---- 右键空白处返回首页 ----
     def eventFilter(self, obj, event) -> bool:
@@ -923,6 +965,26 @@ class PageGridDialog(QDialog):
         self.on_change()
 
     # ---- 页面水印操作 ----
+    def open_fullscreen(self, page: int) -> None:
+        """打开单页全屏视图；关闭后同步刷新本网格中该页瓦片。"""
+        if not (0 <= page < len(self.pdf.pages)):
+            return
+        self.set_current(page)
+        dialog = FullScreenPageDialog(
+            self.pdf,
+            self.on_change,
+            image_paths=self.image_paths,
+            selected_image_index=self.current_image_index,
+            page=page,
+            parent=self,
+        )
+        # 保住 Python 引用：构造里挂起的 QTimer.singleShot(0, ...) 需要
+        # 包装器存活；exec 被替换/未跑事件循环时提前回收会访问违例。
+        self._fs_dialog = dialog
+        dialog.exec()
+        self.rerender_tile(page)
+        self.set_current(page)
+
     def toggle_page(self, page: int) -> None:
         self.pdf.pages[page].wm = not self.pdf.pages[page].wm
         self.render()
@@ -939,6 +1001,378 @@ class PageGridDialog(QDialog):
             p.wm = False
         self.render()
         self.on_change()
+
+
+# ---------------------------------------------------------------- 单页全屏视图
+class FullScreenPageDialog(QDialog):
+    """单页全屏查看与编辑。
+
+    交互（与网格视图同一套坐标合同，所有位移/尺寸仍以 PDF pt 记录）：
+    - 右键点击页面：切换本页 添加/不添加 图章；
+    - 按住左键拖动：移动当前选中水印图；
+    - 滚轮：调节图章大小（百分比/厘米/固定宽度模式生效）；
+    - 左右悬浮按钮（或 ←/→ 方向键）：上一页、下一页；
+    - 右键页面外空白：返回页面网格。
+    """
+
+    MARGIN = 56          # 页面与窗口边缘的最小留白
+    SIDE_BUTTON_W = 96   # 悬浮翻页按钮宽度
+
+    def __init__(self, pdf: MockPdf, on_change, image_paths=None,
+                 selected_image_index: int = 0, page: int = 0, parent=None):
+        super().__init__(parent)
+        self.pdf = pdf
+        self.on_change = on_change
+        self.image_paths = list(image_paths or [])
+        self.current_image_index = max(0, selected_image_index)
+        self.current_page = max(0, min(page, len(pdf.pages) - 1))
+        self._bg_cache: dict[int, object] = {}
+        self._stamp_src: dict[int, QImage] = {}
+        self._stamp_scaled: dict[tuple, QPixmap] = {}
+        self._display_base: Optional[QPixmap] = None   # 底图缩放缓存
+        self._display_geo: Optional[tuple] = None      # (page, w, h)
+        self.press: Optional[QPointF] = None
+        self.press_page = -1
+        self.dragging = False
+        self.base_dx = 0.0
+        self.base_dy = 0.0
+
+        self.setWindowTitle(pdf.name)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setGeometry(QApplication.primaryScreen().availableGeometry())
+        self.setStyleSheet(GLOBAL_QSS
+                           + "QDialog{background:#0b1220;}")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._title_bar = build_dialog_titlebar(
+            pdf.name, "", self.close)
+        # 副标题换成页码指示
+        self.page_label = self._title_bar.findChild(QLabel, "dlg_subtitle")
+        outer.addWidget(self._title_bar)
+        outer.addStretch(1)   # 标题栏置顶，其余空间全部留给页面绘制
+
+        # ---- 左右悬浮翻页按钮 ----
+        self.btn_prev = QPushButton("‹  上一页", self)
+        self.btn_next = QPushButton("下一页  ›", self)
+        self.btn_prev.setCursor(Qt.PointingHandCursor)
+        self.btn_next.setCursor(Qt.PointingHandCursor)
+        self.btn_prev.clicked.connect(self._go_prev)
+        self.btn_next.clicked.connect(self._go_next)
+        for btn in (self.btn_prev, self.btn_next):
+            # 固定尺寸：默认 sizeHint 在无边框窗口下高度不足，文字被裁剪
+            btn.setFixedSize(112, 40)
+            btn.setStyleSheet(
+                "QPushButton{background:rgba(18,27,44,0.72);"
+                "color:#c7d2e0;border:1px solid #2a3a57;"
+                "border-radius:20px;padding:0;font-size:13px;}"
+                "QPushButton:hover{background:rgba(34,49,84,0.85);"
+                "color:#ffffff;border-color:#3c5176;}"
+                "QPushButton:disabled{color:#54627a;"
+                "background:rgba(19,29,48,0.55);border-color:#1d2942;}")
+        # 几何已由 setGeometry 定死，直接同步初始化即可；
+        # 延迟 singleShot 在 exec 被替换/包装器提前回收时会访问违例。
+        self._first_layout()
+
+    # ---- 布局 ----
+    def _first_layout(self) -> None:
+        self._place_side_buttons()
+        self.set_current(self.current_page)
+
+    def _update_page_label(self) -> None:
+        total = len(self.pdf.pages)
+        if self.page_label is not None:
+            self.page_label.setText(f"·  第 {self.current_page + 1} / {total} 页")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._display_base = None
+        self._display_geo = None
+        self._place_side_buttons()
+        self._rerender()
+
+    def _place_side_buttons(self) -> None:
+        if not hasattr(self, "btn_prev"):
+            return
+        y = (self.height() - self.btn_prev.height()) // 2
+        self.btn_prev.move(20, y)
+        self.btn_next.move(self.width() - 20 - self.btn_next.width(), y)
+
+    # ---- 页面显示矩形 / 换算 ----
+    def _page_rect(self) -> QRectF:
+        """当前页位图在窗口内的显示矩形（保持纵横比、居中）。"""
+        bg = self._background(self.current_page)
+        title_h = self._title_bar.height() if self._title_bar else 44
+        if bg is not None:
+            bw, bh = bg.size
+        else:
+            bw, bh = PAGE_W * PREVIEW_ZOOM, PAGE_H * PREVIEW_ZOOM
+        avail_w = max(60.0, self.width() - 2 * self.MARGIN)
+        avail_h = max(60.0, self.height() - title_h - 2 * self.MARGIN)
+        scale = min(avail_w / bw, avail_h / bh)
+        w, h = bw * scale, bh * scale
+        x = (self.width() - w) / 2
+        y = title_h + (self.height() - title_h - h) / 2
+        return QRectF(x, y, w, h)
+
+    def _pt_per_px(self) -> Optional[float]:
+        """全屏视图中每个控件像素对应的 PDF 点（pt）。"""
+        rect = self._page_rect()
+        if rect.width() <= 0:
+            return None
+        bg = self._background(self.current_page)
+        pt_w = (bg.size[0] / PREVIEW_ZOOM) if bg is not None else PAGE_W
+        return pt_w / rect.width()
+
+    # ---- 渲染 ----
+    def _background(self, page: int):
+        if page not in self._bg_cache:
+            if self.pdf.path and os.path.exists(self.pdf.path):
+                try:
+                    _, _, pil = render_page_bg(Path(self.pdf.path), page,
+                                               zoom=PREVIEW_ZOOM)
+                    self._bg_cache[page] = pil
+                except Exception:
+                    self._bg_cache[page] = None
+            else:
+                self._bg_cache[page] = None
+        return self._bg_cache[page]
+
+    def _stamp_rect_view(self, st: PageState, page: int, idx: int, path: str):
+        """水印图 idx 在全屏显示矩形中的矩形（窗口像素）。"""
+        bg = self._background(page)
+        if bg is None:
+            return None
+        rect = self._page_rect()
+        bw, bh = bg.size
+        pt_w, pt_h = bw / PREVIEW_ZOOM, bh / PREVIEW_ZOOM
+        iw, ih = image_native_size(Path(path))
+        dx, dy = st.image_offsets.get(idx, (st.dx, st.dy))
+        local = replace(st, wm=True, dx=dx, dy=dy, image_offsets={})
+        lx, ly, lw, lh = rect_for(page_layout(local, 1.0, image_path=path,
+                                              native_size=(iw, ih)),
+                                  pt_w, pt_h, iw, ih)
+        k_disp = rect.width() / bw            # 显示像素 / 位图像素
+        scale = PREVIEW_ZOOM * k_disp         # 显示像素 / pt
+        return (rect.x() + lx * scale, rect.y() + ly * scale,
+                lw * scale, lh * scale)
+
+    def _stamp_pix(self, idx: int, path: str, w: int, h: int) -> QPixmap:
+        """按目标尺寸缩放水印图（带缓存；w/h 相同即命中）。"""
+        key = (idx, w, h)
+        cached = self._stamp_scaled.get(key)
+        if cached is not None:
+            return cached
+        src = self._stamp_src.get(idx)
+        if src is None:
+            from PIL import Image
+            with Image.open(path) as im:
+                rgba = im.convert("RGBA")
+            src = QImage(rgba.tobytes(), rgba.width, rgba.height,
+                         rgba.width * 4, QImage.Format_RGBA8888).copy()
+            self._stamp_src[idx] = src
+        if len(self._stamp_scaled) > 96:
+            self._stamp_scaled.clear()
+        pix = QPixmap.fromImage(src).scaled(
+            max(1, w), max(1, h), Qt.IgnoreAspectRatio,
+            Qt.SmoothTransformation)
+        self._stamp_scaled[key] = pix
+        return pix
+
+    def _display_base_pix(self) -> Optional[QPixmap]:
+        """当前页底图缩放到显示矩形（缓存；拖动/滚轮时直接复用）。"""
+        page, rect = self.current_page, self._page_rect()
+        w, h = int(rect.width()), int(rect.height())
+        if (self._display_base is not None
+                and self._display_geo == (page, w, h)):
+            return self._display_base
+        bg = self._background(page)
+        base = QPixmap(max(1, w), max(1, h))
+        base.fill(QColor("#0f172a"))
+        if bg is not None:
+            img = QImage(bg.tobytes(), bg.size[0], bg.size[1],
+                         bg.size[0] * 4, QImage.Format_RGBA8888).copy()
+            painter = QPainter(base)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            scaled = QPixmap.fromImage(img).scaled(
+                base.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap((base.width() - scaled.width()) // 2,
+                                (base.height() - scaled.height()) // 2,
+                                scaled)
+            painter.end()
+        else:
+            # 无真实 PDF：复用模拟绘制（白色页面 + 模拟水印）
+            render_page(base, self.pdf, page, self.image_paths)
+        self._display_base = base
+        self._display_geo = (page, w, h)
+        return base
+
+    def _rerender(self) -> None:
+        """重绘当前页：底图缓存永远保持干净，水印只画在当帧副本上。
+
+        _display_base_pix() 返回的是跨帧复用的缓存 QPixmap 本体；
+        若直接在上面画水印，每次拖动/滚轮都会把水印叠加进缓存，
+        形成拖影/花屏（网格视图 _composite_quick 用 geo[0].copy()，
+        这里必须同样先拷贝再绘制）。
+        """
+        base = self._display_base_pix()
+        self._pix = base.copy() if base is not None else None
+        st = self.pdf.pages[self.current_page]
+        if st.wm and self.image_paths and self._pix is not None:
+            view_rect = self._page_rect()
+            ox, oy = view_rect.x(), view_rect.y()
+            painter = QPainter(self._pix)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform)
+            painter.setOpacity(st.opacity)
+            for idx, path in enumerate(self.image_paths):
+                try:
+                    rect = self._stamp_rect_view(st, self.current_page,
+                                                 idx, path)
+                    if rect is None or rect[2] < 1 or rect[3] < 1:
+                        continue
+                    # _stamp_rect_view 返回窗口坐标；_pix 是页面位图，
+                    # 必须减去页面原点，否则图章被位移并遭位图边界裁剪。
+                    stamp = self._stamp_pix(idx, path,
+                                            max(1, round(rect[2])),
+                                            max(1, round(rect[3])))
+                    painter.drawPixmap(QPointF(rect[0] - ox, rect[1] - oy),
+                                       stamp)
+                except Exception:
+                    continue   # 单张图片缺失时跳过，不影响其他水印
+            painter.end()
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        paint_brand_background(painter, self.width(), self.height(),
+                               content_left=0, wf_alpha=0.05)
+        rect = self._page_rect()
+        if self._pix is not None and not self._pix.isNull():
+            # 页面投影 + 圆角裁剪
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 90))
+            painter.drawRoundedRect(
+                QRectF(rect.x() + 6, rect.y() + 8, rect.width(),
+                       rect.height()), 8, 8)
+            path = QPainterPath()
+            path.addRoundedRect(rect, 8, 8)
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(rect.topLeft(), self._pix)
+            painter.restore()
+            painter.setPen(QPen(QColor("#24324e"), 1))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect, 8, 8)
+        painter.end()
+
+    # ---- 当前页 ----
+    def set_current(self, page: int) -> None:
+        if not (0 <= page < len(self.pdf.pages)):
+            return
+        self.current_page = page
+        self._display_base = None
+        self._display_geo = None
+        self._update_page_label()
+        self.btn_prev.setEnabled(page > 0)
+        self.btn_next.setEnabled(page < len(self.pdf.pages) - 1)
+        self._rerender()
+
+    def _go_prev(self) -> None:
+        self.set_current(self.current_page - 1)
+
+    def _go_next(self) -> None:
+        self.set_current(self.current_page + 1)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Left:
+            self._go_prev()
+            return
+        if event.key() == Qt.Key_Right:
+            self._go_next()
+            return
+        super().keyPressEvent(event)
+
+    # ---- 页面水印操作 ----
+    def toggle_page(self, page: int) -> None:
+        self.pdf.pages[page].wm = not self.pdf.pages[page].wm
+        self._rerender()
+        self.on_change()
+
+    def adjust_stamp_size(self, steps: int) -> None:
+        """滚轮调大小：以步进调节当前页图章尺寸（页面级参数）。"""
+        if not steps or not (0 <= self.current_page < len(self.pdf.pages)):
+            return
+        st = self.pdf.pages[self.current_page]
+        if not st.wm:
+            return
+        if st.size_mode == MODE_PERCENT:
+            st.percent = min(200.0, max(1.0, st.percent + 2.0 * steps))
+        elif st.size_mode == MODE_CM:
+            delta = 0.2 * steps
+            st.cm_w = min(60.0, max(0.1, st.cm_w + delta))
+            st.cm_h = min(60.0, max(0.1, st.cm_h + delta))
+        elif st.size_mode == MODE_FIXED:
+            st.fixed_width = min(2000.0, max(1.0, st.fixed_width + 10.0 * steps))
+        else:   # MODE_ORIGINAL：无尺寸参数
+            return
+        self._rerender()
+        self.on_change()
+
+    # ---- 鼠标 / 滚轮 ----
+    def mousePressEvent(self, event) -> None:
+        pos = QPointF(event.position())
+        rect = self._page_rect()
+        inside = rect.contains(pos)
+        if event.button() == Qt.RightButton:
+            if inside:
+                self.toggle_page(self.current_page)
+            else:
+                self.close()          # 右键页面外空白：返回页面网格
+            return
+        if event.button() == Qt.LeftButton and inside:
+            self.press = pos
+            self.press_page = self.current_page
+            self.dragging = False
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.press is None:
+            return
+        dx = event.position().x() - self.press.x()
+        dy = event.position().y() - self.press.y()
+        if not self.dragging and (abs(dx) > 3 or abs(dy) > 3):
+            self.dragging = True
+            st = self.pdf.pages[self.press_page]
+            img_idx = self.current_image_index
+            # 以该图片在该页上次保存的位置为基准（与网格拖动一致）
+            self.base_dx, self.base_dy = st.image_offsets.get(
+                img_idx, (st.dx, st.dy))
+            st.image_offsets[img_idx] = (self.base_dx, self.base_dy)
+        if not self.dragging:
+            return
+        st = self.pdf.pages[self.press_page]
+        img_idx = self.current_image_index
+        k = self._pt_per_px()
+        if k is None:
+            k = 1.0
+        st.image_offsets[img_idx] = (self.base_dx + dx * k,
+                                     self.base_dy + dy * k)
+        self._rerender()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.press is not None:
+            if self.dragging:
+                self.on_change()
+            self.press = None
+            self.dragging = False
+            self.press_page = -1
+
+    def wheelEvent(self, event) -> None:
+        steps = int(round(event.angleDelta().y() / 120.0))
+        if steps:
+            self.adjust_stamp_size(steps)
+        event.accept()
 
 
 # ---------------------------------------------------------------- 主窗口
@@ -1343,6 +1777,8 @@ class DemoWindow(QMainWindow):
         self.files: List[MockPdf] = []
         self._images: List[str] = []
         self._output_dir: Optional[str] = ""
+        # 某些机器上原生目录选择框「确定」后拿不到路径，本次运行内改用内建对话框
+        self._native_dir_dialog_broken = False
         self.cards: List[PdfCard] = []
         self._export_active = False
         self._export_thread: Optional[QThread] = None
@@ -1490,9 +1926,13 @@ class DemoWindow(QMainWindow):
         lay = self._dialog_head(dlg, "使用帮助", APP_SLOGAN)
         steps = [
             ("首页", "鼠标左键点击文档缩略图，进入文档详情。"),
+            ("文档详情", "左键点击页面预览，进入该页全屏视图。"),
             ("文档详情", "在页面预览上点击鼠标右键，切换「添加本页图章 / "
                          "删除本页图章」。"),
-            ("文档详情", "在页面预览上按住鼠标左键，即可移动图章。"),
+            ("文档详情", "在页面预览上按住鼠标左键拖动，即可移动图章。"),
+            ("全屏视图", "与页面预览相同：右键切换图章、按住左键拖动图章；"
+                         "滚轮调节图章大小；左右悬浮按钮或方向键翻页；"
+                         "右键页面外空白返回。"),
             ("文档详情", "在空白位置点击鼠标右键，返回首页。"),
         ]
         for i, (where, text) in enumerate(steps, 1):
@@ -1748,13 +2188,23 @@ class DemoWindow(QMainWindow):
         # 导出
         exp_box = QGroupBox("导出")
         eb = QVBoxLayout(exp_box)
-        dir_row = QHBoxLayout()
+        dir_row = QVBoxLayout()
         self.out_dir_label = QLabel("未选择输出目录")
-        dir_row.addWidget(self.out_dir_label, 1)
+        self.out_dir_label.setWordWrap(True)
+        self.out_dir_label.setToolTip("双击这里可以手动填写输出目录")
+        self.out_dir_label.installEventFilter(self)
+        dir_row.addWidget(self.out_dir_label)
+        dir_buttons = QHBoxLayout()
         btn_dir = QPushButton("选择目录")
         self.btn_dir = btn_dir
+        btn_dir.setToolTip("打开目录选择框")
         btn_dir.clicked.connect(self._pick_dir)
-        dir_row.addWidget(btn_dir)
+        dir_buttons.addWidget(btn_dir, 1)
+        self.btn_manual_dir = QPushButton("手动输入")
+        self.btn_manual_dir.setToolTip("选择框不可用时，直接填写输出目录路径")
+        self.btn_manual_dir.clicked.connect(self._type_dir)
+        dir_buttons.addWidget(self.btn_manual_dir)
+        dir_row.addLayout(dir_buttons)
         eb.addLayout(dir_row)
         self.btn_export = QPushButton("导出全部")
         self.btn_export.setObjectName("btn_primary")
@@ -1767,6 +2217,11 @@ class DemoWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.status_label.setWordWrap(True)
         eb.addWidget(self.status_label)
+        self.btn_open_dir = QPushButton("打开输出文件夹")
+        self.btn_open_dir.setToolTip("在系统文件管理器中打开输出目录")
+        self.btn_open_dir.setEnabled(False)
+        self.btn_open_dir.clicked.connect(self._open_output_dir)
+        eb.addWidget(self.btn_open_dir)
         self.btn_export_details = QPushButton("导出详情")
         self.btn_export_details.setObjectName("btn_export_details")
         self.btn_export_details.setEnabled(False)
@@ -1982,13 +2437,104 @@ class DemoWindow(QMainWindow):
                 }
         self.refresh_cards()
 
+    def _default_output_dir(self) -> str:
+        """给选择框一个确定存在的起始目录，避免落到 Qt 记住的陈旧位置。"""
+        candidates = (
+            QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.DocumentsLocation),
+            str(Path.home()),
+            os.getcwd(),
+        )
+        for candidate in candidates:
+            if candidate and os.path.isdir(candidate):
+                return candidate
+        return ""
+
+    def _ask_directory(self, title: str) -> tuple[str, bool]:
+        """选目录，返回 (目录, 是否「点了确定却拿不到路径」)。
+
+        静态方法 QFileDialog.getExistingDirectory() 把「取消」和「确定但取不到
+        路径」都变成空串：在 Windows 上选中「此电脑」「网络」、库或手机这类没有
+        文件系统路径的虚拟位置时，原生对话框会确定后返回空。这里用实例对话框
+        区分两者，遇到后者自动换 Qt 内建对话框再选一次，并在本次运行内记住
+        原生对话框不可用，免得每次都要点两遍。
+        """
+        start = self._output_dir if self._output_dir_ok() else \
+            self._default_output_dir()
+        attempts = (False,) if self._native_dir_dialog_broken else (True, False)
+        for native in attempts:
+            dialog = QFileDialog(self, title)
+            dialog.setFileMode(QFileDialog.FileMode.Directory)
+            dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+            dialog.setOption(QFileDialog.Option.DontUseNativeDialog, not native)
+            if start:
+                dialog.setDirectory(start)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            selected = dialog.selectedFiles()
+            dialog.deleteLater()
+            if accepted and selected and os.path.isdir(selected[0]):
+                return os.path.normpath(selected[0]), False
+            if not accepted:
+                return "", False          # 用户取消，不再弹第二个
+            if native:
+                self._native_dir_dialog_broken = True
+        return "", True
+
+    def _open_output_dir(self) -> None:
+        """用系统文件管理器打开当前输出目录。"""
+        if not self._output_dir_ok():
+            self.status_label.setText("请先选择有效的输出目录")
+            return
+        try:
+            os.startfile(self._output_dir)
+        except OSError as exc:
+            self.status_label.setText(f"无法打开输出目录：{exc}")
+
     def _pick_dir(self) -> None:
         if self._export_active:
             return
-        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        d, empty_result = self._ask_directory("选择输出目录")
         if d:
-            self._output_dir = os.path.normpath(d)
-            self.out_dir_label.setText(self._output_dir)
+            self._output_dir = d
+            self.out_dir_label.setText(d)
+            self.status_label.setText(f"输出目录：{d}")
+        elif empty_result:
+            self.status_label.setText(
+                "没有取到目录路径（「此电脑」「网络」等位置没有磁盘路径），"
+                "请重新选择磁盘上的文件夹，或点「手动输入」直接填写")
+        self.btn_open_dir.setEnabled(self._output_dir_ok())
+
+    def _apply_output_dir(self, raw: str) -> bool:
+        """写入输出目录；非法路径给出提示而不改动已有选择。"""
+        d = os.path.normpath(raw.strip().strip('"'))
+        if not os.path.isdir(d):
+            self.status_label.setText(f"目录不存在：{d}")
+            self.btn_open_dir.setEnabled(self._output_dir_ok())
+            return False
+        self._output_dir = d
+        self.out_dir_label.setText(d)
+        self.status_label.setText(f"输出目录：{d}")
+        self.btn_open_dir.setEnabled(True)
+        return True
+
+    def _type_dir(self) -> None:
+        """手动填写输出目录：选择框在部分机器上不可用（或选不中磁盘路径）时的兜底。"""
+        if self._export_active:
+            return
+        current = self._output_dir if self._output_dir_ok() else \
+            self._default_output_dir()
+        text, ok = QInputDialog.getText(
+            self, "输入输出目录", "目录路径（可直接粘贴，如 D:\\导出）：",
+            QLineEdit.Normal, current)
+        if ok:
+            self._apply_output_dir(text)
+
+    def eventFilter(self, obj, event) -> bool:
+        if (obj is self.out_dir_label
+                and event.type() == QEvent.Type.MouseButtonDblClick):
+            self._type_dir()
+            return True
+        return super().eventFilter(obj, event)
 
     def _on_export_button_clicked(self) -> None:
         if self._export_active:
